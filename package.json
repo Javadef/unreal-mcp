@@ -1,0 +1,19 @@
+{
+  "name": "opencode-ue-bridge",
+  "version": "1.0.0",
+  "description": "MCP server bridging OpenCode to Unreal Engine 5 editor via a local TCP connection",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
