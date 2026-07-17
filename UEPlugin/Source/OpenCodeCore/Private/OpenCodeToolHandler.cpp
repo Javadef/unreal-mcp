@@ -151,6 +151,11 @@ FOpenCodeResponse FOpenCodeToolHandler::HandlePing(const FOpenCodeRequest& Reque
 	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
 	Data->SetStringField(TEXT("status"), TEXT("pong"));
 	Data->SetStringField(TEXT("pluginVersion"), TEXT("1.0.0"));
+	// Build provenance: the compiled DLL can lag (or lead) whichever source
+	// checkout you're reading. These answer "which source, compiled when?"
+	// before you spend an hour editing a file the editor never loaded.
+	Data->SetStringField(TEXT("buildTimestamp"), TEXT(__DATE__ " " __TIME__));
+	Data->SetStringField(TEXT("compiledFrom"), ANSI_TO_TCHAR(__FILE__));
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }
 
@@ -1513,7 +1518,18 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGenerateCode(const FOpenCodeReques
 		return FOpenCodeResponse::Failure(Request.Id, TEXT("filePath and content are required"));
 	}
 
+	// Containment check: resolve ../ etc. and require the final absolute path
+	// to stay under Source/. Without this, a filePath of "..\\..\\x" writes
+	// anywhere on disk — combined with a network-reachable listener that was
+	// remote arbitrary file write.
 	FString FullPath = FPaths::ProjectDir() / TEXT("Source") / FilePath;
+	FPaths::CollapseRelativeDirectories(FullPath);
+	const FString SourceRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Source/"));
+	const FString FullAbs = FPaths::ConvertRelativePathToFull(FullPath);
+	if (!FullAbs.StartsWith(SourceRoot))
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("filePath must resolve inside the project Source/ directory"));
+	}
 	FString Dir = FPaths::GetPath(FullPath);
 	IFileManager::Get().MakeDirectory(*Dir, true);
 

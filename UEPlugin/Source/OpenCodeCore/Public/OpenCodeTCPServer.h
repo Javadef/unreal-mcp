@@ -38,7 +38,7 @@ private:
 	FCriticalSection ConnectionsLock;
 
 	void AcceptConnection(FSocket* ClientSocket);
-	void RemoveConnection(FOpenCodeTCPConnection* Connection);
+	void ReapFinishedConnections();
 
 	friend class FOpenCodeTCPConnection;
 };
@@ -54,6 +54,12 @@ public:
 
 	void Send(const FString& JsonMessage);
 
+	/// True once Run() has returned — the server's accept loop reaps (deletes)
+	/// finished connections. Previously a disconnecting connection removed
+	/// itself from the server's list without anyone deleting it, leaking the
+	/// thread object + socket on every client disconnect.
+	bool IsFinished() const { return bFinished; }
+
 private:
 	FSocket* Socket;
 	FOpenCodeMessageDelegate MessageHandler;
@@ -61,6 +67,7 @@ private:
 	FRunnableThread* Thread;
 	FThreadSafeBool bIsRunning;
 	FThreadSafeBool bStopRequested;
+	FThreadSafeBool bFinished;
 
 	TArray<uint8> ReadBuffer;
 };

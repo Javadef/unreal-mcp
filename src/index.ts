@@ -7,7 +7,9 @@ import * as net from "node:net";
 // TCP connection to the UE5 editor plugin
 // ─────────────────────────────────────────────
 
-const UE_HOST = process.env.UEOC_HOST || "localhost";
+// 127.0.0.1 explicitly, not "localhost": the UE plugin binds IPv4 loopback
+// only, and "localhost" can resolve to ::1 first depending on the resolver.
+const UE_HOST = process.env.UEOC_HOST || "127.0.0.1";
 const UE_PORT = parseInt(process.env.UEOC_PORT || "3099", 10);
 
 let socket: net.Socket | null = null;
