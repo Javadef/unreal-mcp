@@ -81,7 +81,7 @@ function scheduleReconnect() {
   }, 2000);
 }
 
-function sendToUE(request: Record<string, unknown>): Promise<unknown> {
+function sendToUE(request: Record<string, unknown>, timeoutMs = 15000): Promise<unknown> {
   return new Promise((resolve, reject) => {
     connect().then((sock) => {
       const id = crypto.randomUUID();
@@ -92,7 +92,7 @@ function sendToUE(request: Record<string, unknown>): Promise<unknown> {
       const timeout = setTimeout(() => {
         responseResolvers.delete(id);
         reject(new Error(`Timeout waiting for UE response: ${request.tool}`));
-      }, 15000);
+      }, timeoutMs);
 
       const origResolver = responseResolvers.get(id)!;
       responseResolvers.set(id, (data: unknown) => {
@@ -324,6 +324,20 @@ server.tool("get_material_graph",
   { assetPath: z.string().describe("Full asset path to Material or MaterialFunction") },
   async ({ assetPath }) => {
     const result = await sendToUE({ tool: "get_material_graph", args: { assetPath } });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.tool("run_python",
+  "Execute Python in the UE editor's embedded interpreter (the `unreal` module is available). The generic escape hatch: query or modify anything the editor Python API covers — assets, actors, properties, imports — without a bespoke tool. Returns captured log output (print() lands here as info entries). Requires the 'Python Editor Script Plugin' to be enabled.",
+  {
+    code: z.string().describe("Python source to execute. Multi-line is fine in exec mode. Use print() or unreal.log() to emit results."),
+    mode: z.enum(["exec", "eval"]).optional().describe("exec (default): run statements. eval: evaluate a single expression and return its repr() as `result`."),
+  },
+  async (args) => {
+    // Python can legitimately run long (asset scans, batch edits) — 60s here
+    // instead of the default 15s.
+    const result = await sendToUE({ tool: "run_python", args }, 60000);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );

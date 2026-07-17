@@ -98,4 +98,5 @@ private:
 	static FOpenCodeResponse HandleSearchClasses(const FOpenCodeRequest& Request);
 	static FOpenCodeResponse HandleGetCppHierarchy(const FOpenCodeRequest& Request);
 	static FOpenCodeResponse HandleGetMaterialGraph(const FOpenCodeRequest& Request);
+	static FOpenCodeResponse HandleRunPython(const FOpenCodeRequest& Request);
 };

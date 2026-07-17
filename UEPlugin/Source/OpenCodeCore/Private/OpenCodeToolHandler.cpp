@@ -50,6 +50,9 @@
 #include "LandscapeComponent.h"
 #include "LandscapeDataAccess.h"
 #include "InstancedFoliageActor.h"
+#if WITH_EDITOR
+#include "IPythonScriptPlugin.h"
+#endif
 
 FOpenCodeToolHandler& FOpenCodeToolHandler::Get()
 {
@@ -79,6 +82,7 @@ void FOpenCodeToolHandler::RegisterTools()
 	RegisterTool(TEXT("search_classes"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleSearchClasses));
 	RegisterTool(TEXT("get_cpp_hierarchy"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetCppHierarchy));
 	RegisterTool(TEXT("get_material_graph"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetMaterialGraph));
+	RegisterTool(TEXT("run_python"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleRunPython));
 }
 
 void FOpenCodeToolHandler::RegisterTool(const FString& ToolName, FOpenCodeToolDelegate Delegate)
@@ -1632,4 +1636,61 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetCppHierarchy(const FOpenCodeReq
 	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
 	Data->SetObjectField(TEXT("hierarchy"), BuildHierarchy(Base, 0));
 	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+FOpenCodeResponse FOpenCodeToolHandler::HandleRunPython(const FOpenCodeRequest& Request)
+{
+#if WITH_EDITOR
+	FString Code, Mode;
+	Request.Args->TryGetStringField(TEXT("code"), Code);
+	Request.Args->TryGetStringField(TEXT("mode"), Mode);
+
+	if (Code.IsEmpty())
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("code is required"));
+	}
+
+	IPythonScriptPlugin* Python = IPythonScriptPlugin::Get();
+	if (!Python || !Python->IsPythonAvailable())
+	{
+		return FOpenCodeResponse::Failure(Request.Id,
+			TEXT("Python is not available — enable the 'Python Editor Script Plugin' (PythonScriptPlugin) in Edit > Plugins and restart the editor"));
+	}
+
+	// Generic escape hatch: anything the `unreal` Python API can reach is
+	// scriptable without adding a bespoke C++ tool for it. Runs on the game
+	// thread (module dispatch guarantees that), which Python requires anyway.
+	FPythonCommandEx Cmd;
+	Cmd.Command = Code;
+	Cmd.ExecutionMode = (Mode == TEXT("eval"))
+		? EPythonCommandExecutionMode::EvaluateStatement
+		: EPythonCommandExecutionMode::ExecuteStatement;
+
+	const bool bOk = Python->ExecPythonCommandEx(Cmd);
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetBoolField(TEXT("ok"), bOk);
+	// eval mode: repr() of the expression. On failure: the Python exception text.
+	if (!Cmd.CommandResult.IsEmpty())
+	{
+		Data->SetStringField(TEXT("result"), Cmd.CommandResult);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Log;
+	for (const FPythonLogOutputEntry& Entry : Cmd.LogOutput)
+	{
+		TSharedPtr<FJsonObject> E = MakeShareable(new FJsonObject());
+		E->SetStringField(TEXT("type"),
+			Entry.Type == EPythonLogOutputType::Error   ? TEXT("error")
+			: Entry.Type == EPythonLogOutputType::Warning ? TEXT("warning")
+			: TEXT("info"));
+		E->SetStringField(TEXT("output"), Entry.Output);
+		Log.Add(MakeShareable(new FJsonValueObject(E)));
+	}
+	Data->SetArrayField(TEXT("log"), Log);
+
+	return FOpenCodeResponse::Success(Request.Id, Data);
+#else
+	return FOpenCodeResponse::Failure(Request.Id, TEXT("run_python requires an editor build"));
+#endif
 }

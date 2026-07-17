@@ -28,6 +28,7 @@ public class OpenCodeCore : ModuleRules
 				"UnrealEd",
 				"EditorSubsystem",
 				"BlueprintGraph",
+				"PythonScriptPlugin",
 			});
 		}
 	}
