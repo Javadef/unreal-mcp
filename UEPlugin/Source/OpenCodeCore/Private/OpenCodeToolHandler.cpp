@@ -26,6 +26,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
+#include "Materials/MaterialExpressionComment.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
 #include "Materials/MaterialExpressionStaticSwitchParameter.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
@@ -386,8 +387,13 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	TArray<FAssetData> AssetList;
 	AssetRegistry.GetAssets(Filter, AssetList);
 
-	// Filter by query
+	// Filter by query. `TotalMatches` counts everything that passes the query
+	// filter (for pagination), independent of the Offset/Limit slice that
+	// actually lands in `Results` — these used to be conflated, which made
+	// `total` report the pre-query package count instead of the real match
+	// count (confusing when it disagreed with an empty `results`).
 	TArray<TSharedPtr<FJsonValue>> Results;
+	int32 TotalMatches = 0;
 	int32 Skipped = 0;
 	int32 Added = 0;
 	for (const FAssetData& Asset : AssetList)
@@ -396,12 +402,14 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 		{
 			continue;
 		}
+		TotalMatches++;
+
 		if (Skipped < Offset)
 		{
 			Skipped++;
 			continue;
 		}
-		if (Added >= Limit) break;
+		if (Added >= Limit) continue;
 
 		TSharedPtr<FJsonObject> Item = MakeShareable(new FJsonObject());
 		Item->SetStringField(TEXT("name"), Asset.AssetName.ToString());
@@ -413,7 +421,11 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 
 	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
 	Data->SetArrayField(TEXT("results"), Results);
-	Data->SetNumberField(TEXT("total"), AssetList.Num());
+	Data->SetNumberField(TEXT("total"), TotalMatches);
+	if (PathPrefix.IsEmpty())
+	{
+		Data->SetStringField(TEXT("note"), TEXT("No pathPrefix given — searched /Game only. Plugin content (e.g. marketplace assets) lives under its own mount point, e.g. /PluginName — pass pathPrefix explicitly to search there."));
+	}
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }
 
@@ -1266,6 +1278,13 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 	if (Mat)
 	{
 		Mat->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpression>(AllExpressions);
+		for (const TObjectPtr<UMaterialExpressionComment>& Comment : Mat->GetEditorComments())
+		{
+			if (Comment)
+			{
+				AllExpressions.Add(Comment.Get());
+			}
+		}
 	}
 	else
 	{
@@ -1273,6 +1292,13 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 		for (const TObjectPtr<UMaterialExpression>& E : Exprs)
 		{
 			AllExpressions.Add(E.Get());
+		}
+		for (const TObjectPtr<UMaterialExpressionComment>& Comment : MF->GetEditorComments())
+		{
+			if (Comment)
+			{
+				AllExpressions.Add(Comment.Get());
+			}
 		}
 	}
 
@@ -1290,6 +1316,15 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 		Node->SetNumberField(TEXT("id"), NodeIdx);
 		Node->SetStringField(TEXT("type"), Expr->GetClass()->GetName());
 		Node->SetStringField(TEXT("desc"), Expr->Desc);
+		Node->SetNumberField(TEXT("posX"), Expr->MaterialExpressionEditorX);
+		Node->SetNumberField(TEXT("posY"), Expr->MaterialExpressionEditorY);
+
+		if (UMaterialExpressionComment* Comment = Cast<UMaterialExpressionComment>(Expr))
+		{
+			Node->SetStringField(TEXT("commentText"), Comment->Text);
+			Node->SetNumberField(TEXT("sizeX"), Comment->SizeX);
+			Node->SetNumberField(TEXT("sizeY"), Comment->SizeY);
+		}
 
 		// Function calls
 		if (UMaterialExpressionMaterialFunctionCall* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expr))
@@ -1397,6 +1432,72 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 	}
 
 	Data->SetArrayField(TEXT("expressions"), Nodes);
+
+	// Build expression-to-ID map for connection lookups
+	TMap<UMaterialExpression*, int32> ExprToId;
+	for (int32 i = 0; i < AllExpressions.Num(); ++i)
+	{
+		if (AllExpressions[i])
+		{
+			ExprToId.Add(AllExpressions[i], i);
+		}
+	}
+
+	// Add connections for each node
+	for (int32 i = 0; i < (int32)Nodes.Num(); ++i)
+	{
+		TSharedPtr<FJsonObject> Node = Nodes[i]->AsObject();
+		if (!Node || i >= AllExpressions.Num() || !AllExpressions[i]) continue;
+
+		TArray<TSharedPtr<FJsonValue>> Connections;
+
+		for (TFieldIterator<FStructProperty> PropIt(AllExpressions[i]->GetClass(), EFieldIteratorFlags::IncludeSuper); PropIt; ++PropIt)
+		{
+			FStructProperty* Prop = *PropIt;
+			if (!Prop || !Prop->Struct) continue;
+
+			FName StructName = Prop->Struct->GetFName();
+			if (StructName != FName(TEXT("ExpressionInput")) && StructName != FName(TEXT("MaterialInput"))) continue;
+
+			FExpressionInput* Input = Prop->ContainerPtrToValuePtr<FExpressionInput>(AllExpressions[i]);
+			if (!Input || !Input->Expression) continue;
+
+			int32* FoundId = ExprToId.Find(Input->Expression);
+			if (!FoundId) continue;
+
+			TSharedPtr<FJsonObject> Conn = MakeShareable(new FJsonObject());
+			FString PinName = Input->InputName.IsNone() ? Prop->GetName() : Input->InputName.ToString();
+			Conn->SetStringField(TEXT("inputName"), PinName);
+			Conn->SetNumberField(TEXT("sourceId"), *FoundId);
+			Conn->SetNumberField(TEXT("sourceOutput"), Input->OutputIndex);
+			if (Input->Mask != 0)
+			{
+				Conn->SetNumberField(TEXT("mask"), Input->Mask);
+			}
+			if (Input->MaskR != 0)
+			{
+				Conn->SetBoolField(TEXT("maskR"), Input->MaskR != 0);
+			}
+			if (Input->MaskG != 0)
+			{
+				Conn->SetBoolField(TEXT("maskG"), Input->MaskG != 0);
+			}
+			if (Input->MaskB != 0)
+			{
+				Conn->SetBoolField(TEXT("maskB"), Input->MaskB != 0);
+			}
+			if (Input->MaskA != 0)
+			{
+				Conn->SetBoolField(TEXT("maskA"), Input->MaskA != 0);
+			}
+			Connections.Add(MakeShareable(new FJsonValueObject(Conn)));
+		}
+		if (Connections.Num() > 0)
+		{
+			Node->SetArrayField(TEXT("connections"), Connections);
+		}
+	}
+
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }
 
