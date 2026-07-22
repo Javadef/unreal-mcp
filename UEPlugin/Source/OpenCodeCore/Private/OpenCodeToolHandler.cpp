@@ -380,6 +380,13 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 		Filter.PackagePaths.Add(TEXT("/Game"));
 	}
 
+	// assetType handling. When the string resolves to a real UClass we use the
+	// registry's (recursive) class filter — fast and includes subclasses. When
+	// it does NOT resolve (typo, or a class outside these two modules), we fall
+	// back to a class-NAME substring match applied in the loop below instead of
+	// silently dropping the filter (the old behaviour, which returned every
+	// asset and looked like the filter was ignored).
+	bool bAssetTypeResolved = false;
 	if (!AssetTypeFilter.IsEmpty())
 	{
 		UClass* Class = FindObject<UClass>(nullptr, *(TEXT("/Script/Engine.") + AssetTypeFilter));
@@ -390,6 +397,7 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 		if (Class)
 		{
 			Filter.ClassPaths.Add(FTopLevelAssetPath(Class));
+			bAssetTypeResolved = true;
 		}
 	}
 
@@ -408,6 +416,15 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	for (const FAssetData& Asset : AssetList)
 	{
 		if (!Query.IsEmpty() && !Asset.AssetName.ToString().Contains(Query, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		// Fallback assetType filter: only runs when the class string didn't
+		// resolve to a UClass above. Substring, case-insensitive, against the
+		// asset's class name (e.g. "MaterialInstance" matches
+		// "MaterialInstanceConstant").
+		if (!AssetTypeFilter.IsEmpty() && !bAssetTypeResolved &&
+			!Asset.AssetClassPath.GetAssetName().ToString().Contains(AssetTypeFilter, ESearchCase::IgnoreCase))
 		{
 			continue;
 		}
@@ -434,6 +451,12 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	if (PathPrefix.IsEmpty())
 	{
 		Data->SetStringField(TEXT("note"), TEXT("No pathPrefix given — searched /Game only. Plugin content (e.g. marketplace assets) lives under its own mount point, e.g. /PluginName — pass pathPrefix explicitly to search there."));
+	}
+	else if (!AssetTypeFilter.IsEmpty() && !bAssetTypeResolved)
+	{
+		Data->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("assetType '%s' is not a UClass in /Script/Engine or /Script/CoreUObject — matched by class-name substring instead. For an exact class filter, pass the C++ class name (e.g. StaticMesh, Texture2D, MaterialInstanceConstant)."),
+			*AssetTypeFilter));
 	}
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }
@@ -1662,9 +1685,14 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleRunPython(const FOpenCodeRequest& 
 	// thread (module dispatch guarantees that), which Python requires anyway.
 	FPythonCommandEx Cmd;
 	Cmd.Command = Code;
+	// exec (default) → ExecuteFile: compiles the command as a literal script
+	// (Py_file_input), so multi-line / multi-statement code works. The older
+	// ExecuteStatement mode uses single_input and rejects anything past one
+	// statement ("multiple statements found while compiling a single statement").
+	// eval → EvaluateStatement: single expression, repr() returned in `result`.
 	Cmd.ExecutionMode = (Mode == TEXT("eval"))
 		? EPythonCommandExecutionMode::EvaluateStatement
-		: EPythonCommandExecutionMode::ExecuteStatement;
+		: EPythonCommandExecutionMode::ExecuteFile;
 
 	const bool bOk = Python->ExecPythonCommandEx(Cmd);
 
