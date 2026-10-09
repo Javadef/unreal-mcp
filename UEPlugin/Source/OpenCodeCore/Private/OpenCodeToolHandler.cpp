@@ -54,9 +54,196 @@
 #include "LandscapeComponent.h"
 #include "LandscapeDataAccess.h"
 #include "InstancedFoliageActor.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/SkyLightComponent.h"
+#include "Components/ExponentialHeightFogComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
+#include "Components/LocalLightComponent.h"
+#include "Engine/PostProcessVolume.h"
+#include "Exporters/Exporter.h"
+#include "MaterialShared.h"
+#include "PixelFormat.h"
+#include "RHIFeatureLevel.h"
+#include "Math/Float16.h"
+#include "HAL/IConsoleManager.h"
+#include "HAL/FileManager.h"
+#if PLATFORM_WINDOWS
+// Header-only use (the interface is pure virtual), so no module dependency.
+#include "Developer/Windows/LiveCoding/Public/ILiveCodingModule.h"
+#endif
 #if WITH_EDITOR
 #include "IPythonScriptPlugin.h"
 #endif
+
+// Tools implemented at the end of this file as free functions (see there).
+static FOpenCodeResponse OCHandleGetStaticMeshData(const FOpenCodeRequest& Request);
+static FOpenCodeResponse OCHandleGetTextureInfo(const FOpenCodeRequest& Request);
+static FOpenCodeResponse OCHandleGetLevelLighting(const FOpenCodeRequest& Request);
+static FOpenCodeResponse OCHandleGetMaterialHlsl(const FOpenCodeRequest& Request);
+static FOpenCodeResponse OCHandleExportAssetText(const FOpenCodeRequest& Request);
+static FOpenCodeResponse OCHandleLiveCompile(const FOpenCodeRequest& Request);
+
+// ======================= REQUEST LOG + CONSOLE HOOKS =======================
+// The editor dashboard lives in another module, and a Live Coding patch cannot
+// add symbols for another module to link against. Both can already reach the
+// console manager, so that is the channel:
+//   OpenCodeBridge.Stats          string variable: a JSON snapshot of the request log
+//   OpenCodeBridge.Run <tool> ..  command: run a tool, result to a file or the log
+namespace OCBridge
+{
+	struct FCall
+	{
+		FString Tool;
+		FString Time;
+		double Ms = 0.0;
+		bool bOk = false;
+	};
+
+	static TArray<FCall> RecentCalls;
+	static TMap<FString, int32> ToolCounts;
+	static int32 TotalCalls = 0;
+	static int32 FailedCalls = 0;
+	static double TotalMs = 0.0;
+
+	static FString OutputDir()
+	{
+		return FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("OpenCodeBridge"));
+	}
+
+	// Relative paths land in <Project>/Saved/OpenCodeBridge.
+	static FString ResolveOutputPath(const FString& Path)
+	{
+		FString Full = FPaths::IsRelative(Path) ? OutputDir() / Path : Path;
+		FPaths::NormalizeFilename(Full);
+		return Full;
+	}
+
+	static void RecordCall(const FString& Tool, double Ms, bool bOk, int32 RegisteredTools)
+	{
+		++TotalCalls;
+		if (!bOk)
+		{
+			++FailedCalls;
+		}
+		TotalMs += Ms;
+		ToolCounts.FindOrAdd(Tool)++;
+
+		FCall Call;
+		Call.Tool = Tool;
+		Call.Time = FDateTime::Now().ToString(TEXT("%H:%M:%S"));
+		Call.Ms = Ms;
+		Call.bOk = bOk;
+		RecentCalls.Add(Call);
+		if (RecentCalls.Num() > 40)
+		{
+			RecentCalls.RemoveAt(0, RecentCalls.Num() - 40);
+		}
+
+		IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(TEXT("OpenCodeBridge.Stats"));
+		if (!Var)
+		{
+			return;
+		}
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject());
+		Root->SetNumberField(TEXT("total"), TotalCalls);
+		Root->SetNumberField(TEXT("failed"), FailedCalls);
+		Root->SetNumberField(TEXT("avgMs"), TotalCalls > 0 ? TotalMs / TotalCalls : 0.0);
+		Root->SetNumberField(TEXT("registeredTools"), RegisteredTools);
+		Root->SetStringField(TEXT("build"), FString(TEXT(__DATE__)) + TEXT(" ") + TEXT(__TIME__));
+		TSharedPtr<FJsonObject> Counts = MakeShareable(new FJsonObject());
+		for (const TPair<FString, int32>& Pair : ToolCounts)
+		{
+			Counts->SetNumberField(Pair.Key, Pair.Value);
+		}
+		Root->SetObjectField(TEXT("tools"), Counts);
+		TArray<TSharedPtr<FJsonValue>> Recent;
+		for (const FCall& Entry : RecentCalls)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShareable(new FJsonObject());
+			Obj->SetStringField(TEXT("tool"), Entry.Tool);
+			Obj->SetStringField(TEXT("time"), Entry.Time);
+			Obj->SetNumberField(TEXT("ms"), Entry.Ms);
+			Obj->SetBoolField(TEXT("ok"), Entry.bOk);
+			Recent.Add(MakeShareable(new FJsonValueObject(Obj)));
+		}
+		Root->SetArrayField(TEXT("recent"), Recent);
+		Var->Set(*JSON_OBJ_TO_STRING(Root), ECVF_SetByCode);
+	}
+
+	// OpenCodeBridge.Run <tool> [out=<file>] [<json args, no spaces needed>]
+	static void RunCommand(const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("Usage: OpenCodeBridge.Run <tool> [out=<file>] [<json args>]"));
+			return;
+		}
+		FOpenCodeRequest Request;
+		Request.Id = TEXT("console");
+		Request.Tool = Args[0];
+		Request.Args = MakeShareable(new FJsonObject());
+
+		FString OutFile;
+		FString JsonText;
+		for (int32 i = 1; i < Args.Num(); ++i)
+		{
+			if (Args[i].StartsWith(TEXT("out=")))
+			{
+				OutFile = Args[i].RightChop(4);
+			}
+			else
+			{
+				if (!JsonText.IsEmpty())
+				{
+					JsonText += TEXT(" ");
+				}
+				JsonText += Args[i];
+			}
+		}
+		if (!JsonText.IsEmpty())
+		{
+			TSharedPtr<FJsonObject> Parsed;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+			if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+			{
+				Request.Args = Parsed;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("OpenCodeBridge.Run: could not parse the arguments as JSON: %s"), *JsonText);
+				return;
+			}
+		}
+		if (!OutFile.IsEmpty())
+		{
+			Request.Args->SetStringField(TEXT("outputFile"), OutFile);
+		}
+
+		const FOpenCodeResponse Response = FOpenCodeToolHandler::Get().Dispatch(Request);
+		UE_LOG(LogTemp, Display, TEXT("OpenCodeBridge.Run %s -> %s"), *Request.Tool, *Response.ToJson().Left(1500));
+	}
+
+	static void EnsureConsoleHooks()
+	{
+		IConsoleManager& Console = IConsoleManager::Get();
+		if (!Console.FindConsoleVariable(TEXT("OpenCodeBridge.Stats")))
+		{
+			Console.RegisterConsoleVariable(TEXT("OpenCodeBridge.Stats"), FString(TEXT("{}")),
+				TEXT("JSON snapshot of the OpenCode bridge's request log. Read by the dashboard tab."), ECVF_Default);
+		}
+		if (!Console.FindConsoleVariable(TEXT("OpenCodeBridge.Client")))
+		{
+			Console.RegisterConsoleVariable(TEXT("OpenCodeBridge.Client"), FString(),
+				TEXT("Path of the MCP server script that last connected to the bridge (it says so when it connects)."), ECVF_Default);
+		}
+		if (!Console.IsNameRegistered(TEXT("OpenCodeBridge.Run")))
+		{
+			Console.RegisterConsoleCommand(TEXT("OpenCodeBridge.Run"),
+				TEXT("OpenCodeBridge.Run <tool> [out=<file>] [<json args>] - run a bridge tool. The result goes to the file (relative paths: Saved/OpenCodeBridge) or the log."),
+				FConsoleCommandWithArgsDelegate::CreateStatic(&RunCommand), ECVF_Default);
+		}
+	}
+}
 
 FOpenCodeToolHandler& FOpenCodeToolHandler::Get()
 {
@@ -88,6 +275,14 @@ void FOpenCodeToolHandler::RegisterTools()
 	RegisterTool(TEXT("get_material_graph"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetMaterialGraph));
 	RegisterTool(TEXT("get_material_parameters"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetMaterialParameters));
 	RegisterTool(TEXT("run_python"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleRunPython));
+	RegisterTool(TEXT("get_static_mesh_data"), FOpenCodeToolDelegate::CreateStatic(&OCHandleGetStaticMeshData));
+	RegisterTool(TEXT("get_texture_info"), FOpenCodeToolDelegate::CreateStatic(&OCHandleGetTextureInfo));
+	RegisterTool(TEXT("get_level_lighting"), FOpenCodeToolDelegate::CreateStatic(&OCHandleGetLevelLighting));
+	RegisterTool(TEXT("get_material_hlsl"), FOpenCodeToolDelegate::CreateStatic(&OCHandleGetMaterialHlsl));
+	RegisterTool(TEXT("export_asset_text"), FOpenCodeToolDelegate::CreateStatic(&OCHandleExportAssetText));
+	RegisterTool(TEXT("live_compile"), FOpenCodeToolDelegate::CreateStatic(&OCHandleLiveCompile));
+
+	OCBridge::EnsureConsoleHooks();
 }
 
 void FOpenCodeToolHandler::RegisterTool(const FString& ToolName, FOpenCodeToolDelegate Delegate)
@@ -97,16 +292,85 @@ void FOpenCodeToolHandler::RegisterTool(const FString& ToolName, FOpenCodeToolDe
 
 FOpenCodeResponse FOpenCodeToolHandler::Dispatch(const FOpenCodeRequest& Request)
 {
+	OCBridge::EnsureConsoleHooks();
+
+	// The MCP server introduces itself on connect, so the dashboard can show
+	// (and hand out) the copy that is actually in use. Not a tool; not counted.
+	if (Request.Tool == TEXT("hello"))
+	{
+		FString Server;
+		if (Request.Args.IsValid() && Request.Args->TryGetStringField(TEXT("server"), Server))
+		{
+			if (IConsoleVariable* Client = IConsoleManager::Get().FindConsoleVariable(TEXT("OpenCodeBridge.Client")))
+			{
+				Client->Set(*Server, ECVF_SetByCode);
+			}
+		}
+		return FOpenCodeResponse::Success(Request.Id, MakeShareable(new FJsonObject()));
+	}
+
 	FOpenCodeToolDelegate* Found = ToolDelegates.Find(Request.Tool);
 	if (!Found)
 	{
-		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Unknown tool: %s"), *Request.Tool));
+		// A Live Coding patch can add tools after startup: pick them up.
+		RegisterTools();
+		Found = ToolDelegates.Find(Request.Tool);
 	}
-	if (!Found->IsBound())
+
+	const double StartSeconds = FPlatformTime::Seconds();
+	FOpenCodeResponse Response;
+	if (!Found)
 	{
-		return FOpenCodeResponse::Failure(Request.Id, TEXT("Tool delegate not bound"));
+		Response = FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Unknown tool: %s"), *Request.Tool));
 	}
-	return Found->Execute(Request);
+	else if (!Found->IsBound())
+	{
+		Response = FOpenCodeResponse::Failure(Request.Id, TEXT("Tool delegate not bound"));
+	}
+	else
+	{
+		Response = Found->Execute(Request);
+	}
+
+	// Any tool: "outputFile" sends the result to disk and returns only where it
+	// went. A result carrying a `text` field (HLSL, T3D) is written as that text;
+	// anything else as its JSON.
+	FString OutputFile;
+	if (Response.bSuccess && Response.Data.IsValid() && Request.Args.IsValid()
+		&& Request.Args->TryGetStringField(TEXT("outputFile"), OutputFile) && !OutputFile.IsEmpty())
+	{
+		const FString FullPath = OCBridge::ResolveOutputPath(OutputFile);
+		FString Payload;
+		TSharedPtr<FJsonObject> Summary = MakeShareable(new FJsonObject());
+		if (Response.Data->TryGetStringField(TEXT("text"), Payload))
+		{
+			// Keep the small fields around the text as the summary.
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Response.Data->Values)
+			{
+				if (Field.Key != TEXT("text"))
+				{
+					Summary->SetField(Field.Key, Field.Value);
+				}
+			}
+		}
+		else
+		{
+			Payload = JSON_OBJ_TO_STRING(Response.Data);
+		}
+		if (FFileHelper::SaveStringToFile(Payload, *FullPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			Summary->SetStringField(TEXT("savedTo"), FullPath);
+			Summary->SetNumberField(TEXT("chars"), Payload.Len());
+			Response.Data = Summary;
+		}
+		else
+		{
+			Response = FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Could not write %s"), *FullPath));
+		}
+	}
+
+	OCBridge::RecordCall(Request.Tool, (FPlatformTime::Seconds() - StartSeconds) * 1000.0, Response.bSuccess, ToolDelegates.Num());
+	return Response;
 }
 
 // ======================= TOOL IMPLEMENTATIONS =======================
@@ -1310,10 +1574,184 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSetActorProperty(const FOpenCodeRe
 	return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Actor %s not found"), *ActorName));
 }
 
+// ---- get_material_graph helpers -------------------------------------------
+
+// "MaterialExpressionAdd_3" -> "Add_3". Object names are unique within an asset,
+// so the short name doubles as the node id.
+static FString OCShortExprName(const UObject* Obj)
+{
+	FString Name = Obj ? Obj->GetName() : FString(TEXT("None"));
+	Name.RemoveFromStart(TEXT("MaterialExpression"));
+	return Name;
+}
+
+// "Source.Output" (or "Source[RG]" for a masked unnamed output) for a connected input.
+static FString OCDescribeSource(const FExpressionInput& Input)
+{
+	UMaterialExpression* Source = Input.Expression;
+	if (!Source)
+	{
+		return FString();
+	}
+	FString Out = OCShortExprName(Source);
+	const TArray<FExpressionOutput>& Outputs = Source->GetOutputs();
+	if (Outputs.IsValidIndex(Input.OutputIndex) && !Outputs[Input.OutputIndex].OutputName.IsNone())
+	{
+		Out += TEXT(".");
+		Out += Outputs[Input.OutputIndex].OutputName.ToString();
+	}
+	else
+	{
+		if (Input.OutputIndex != 0)
+		{
+			Out += FString::Printf(TEXT(".%d"), Input.OutputIndex);
+		}
+		if (Input.Mask != 0)
+		{
+			Out += TEXT("[");
+			if (Input.MaskR != 0) Out += TEXT("R");
+			if (Input.MaskG != 0) Out += TEXT("G");
+			if (Input.MaskB != 0) Out += TEXT("B");
+			if (Input.MaskA != 0) Out += TEXT("A");
+			Out += TEXT("]");
+		}
+	}
+	return Out;
+}
+
+// Input/output pin structs: wiring, reported through the input iterator instead.
+static bool OCIsWiringStruct(const UScriptStruct* Struct)
+{
+	if (!Struct)
+	{
+		return false;
+	}
+	const FString Name = Struct->GetName();
+	return Name.EndsWith(TEXT("Input")) || Name.EndsWith(TEXT("Output"));
+}
+
+// Every property the expression's own class hierarchy adds on top of
+// UMaterialExpression whose value differs from the class default: component
+// masks, UV index, constants, transform spaces, parameter names, textures,
+// reroute declarations... Parameter names and defaults are always listed.
+static void OCCollectExprProps(UMaterialExpression* Expr, TArray<TPair<FString, FString>>& OutProps)
+{
+	static const TSet<FName> Skip = {
+		FName(TEXT("ExpressionGUID")), FName(TEXT("Group")), FName(TEXT("SortPriority")),
+		FName(TEXT("ChannelNames")), FName(TEXT("Id")), FName(TEXT("VariableGuid")),
+		FName(TEXT("DeclarationGuid")), FName(TEXT("NodeColor")), FName(TEXT("AttributeSetTypes")),
+		FName(TEXT("AttributeGetTypes")), FName(TEXT("PreAttributeSetTypes")), FName(TEXT("PreAttributeGetTypes")),
+		FName(TEXT("ParameterCustomization")), FName(TEXT("Description")), FName(TEXT("bLastPreviewed")),
+	};
+	static const TSet<FName> Always = {
+		FName(TEXT("ParameterName")), FName(TEXT("DefaultValue")), FName(TEXT("InputName")), FName(TEXT("OutputName")),
+	};
+
+	const UObject* CDO = Expr->GetClass()->GetDefaultObject();
+	for (TFieldIterator<FProperty> It(Expr->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		FProperty* Prop = *It;
+		if (!Prop || Prop->GetOwnerClass() == UMaterialExpression::StaticClass())
+		{
+			continue;
+		}
+		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated))
+		{
+			continue;
+		}
+		const FName PropName = Prop->GetFName();
+		if (Skip.Contains(PropName))
+		{
+			continue;
+		}
+		if (const FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			if (OCIsWiringStruct(StructProp->Struct))
+			{
+				continue;
+			}
+		}
+		if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop))
+		{
+			const FStructProperty* Inner = CastField<FStructProperty>(ArrayProp->Inner);
+			if (Inner && OCIsWiringStruct(Inner->Struct))
+			{
+				continue;
+			}
+		}
+
+		const bool bAlways = Always.Contains(PropName);
+		if (!bAlways && CDO && Prop->Identical_InContainer(Expr, CDO))
+		{
+			continue;
+		}
+
+		FString Value;
+		if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			const UObject* Obj = ObjProp->GetObjectPropertyValue_InContainer(Expr);
+			if (!Obj)
+			{
+				continue;
+			}
+			if (Obj->IsA<UMaterialExpression>())
+			{
+				Value = TEXT("@") + OCShortExprName(Obj);
+			}
+			else
+			{
+				// Assets by package path: enough to load them, shorter than an export path.
+				Value = Obj->GetOutermost()->GetName();
+			}
+		}
+		else if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			// Spelled out: an always-listed false (a static switch's default) must not read as blank.
+			Value = BoolProp->GetPropertyValue_InContainer(Expr) ? TEXT("True") : TEXT("False");
+		}
+		else
+		{
+			Prop->ExportText_InContainer(0, Value, Expr, Expr, Expr, PPF_None);
+		}
+		if (Value.Len() > 200)
+		{
+			Value = Value.Left(200) + TEXT("...");
+		}
+		OutProps.Emplace(PropName.ToString(), MoveTemp(Value));
+	}
+}
+
+// Every connected input, by the pin name the editor shows. Unlike reflecting
+// over FExpressionInput members this reaches function-call inputs and the
+// attribute pins of Set/GetMaterialAttributes.
+static void OCCollectExprInputs(UMaterialExpression* Expr, TArray<TPair<FString, FString>>& OutInputs)
+{
+	for (FExpressionInputIterator It{ Expr }; It; ++It)
+	{
+		const FExpressionInput* Input = It.Input;
+		if (!Input || !Input->Expression)
+		{
+			continue;
+		}
+		const FName PinName = Expr->GetInputName(It.Index);
+		OutInputs.Emplace(PinName.IsNone() ? FString(TEXT("in")) : PinName.ToString(), OCDescribeSource(*Input));
+	}
+}
+
+// Material or MaterialFunction graph.
+//
+// args: assetPath, format ("compact" default | "json").
+//   compact: one string per node, "Name | Prop=Value ... | Pin<-Source.Output, ... // desc"
+//   json:    one object per node {name, type, desc, x, y, props{}, inputs{}}
+// Only the asset's own expressions are listed; called functions are named in
+// `functions` and dumped by a call of their own.
 FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRequest& Request)
 {
 	FString AssetPath;
 	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+	FString Format;
+	Request.Args->TryGetStringField(TEXT("format"), Format);
+	const bool bJson = Format.Equals(TEXT("json"), ESearchCase::IgnoreCase);
 
 	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
 	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath);
@@ -1327,233 +1765,185 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 	UMaterialFunction* MF = Cast<UMaterialFunction>(Asset);
 	if (!Mat && !MF)
 	{
-		Data->SetStringField(TEXT("error"), TEXT("Asset must be a Material or MaterialFunction"));
+		if (const UMaterialInstance* Instance = Cast<UMaterialInstance>(Asset))
+		{
+			const UMaterial* Base = Instance->GetMaterial();
+			Data->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("%s is a MaterialInstance and has no graph of its own. Dump its base material %s, and read the instance's overrides with get_material_parameters."),
+				*Asset->GetName(), Base ? *Base->GetPathName() : TEXT("(none)")));
+		}
+		else
+		{
+			Data->SetStringField(TEXT("error"), TEXT("Asset must be a Material or MaterialFunction"));
+		}
 		return FOpenCodeResponse::Success(Request.Id, Data);
 	}
 
-	TArray<UMaterialExpression*> AllExpressions;
+	TArray<UMaterialExpression*> Expressions;
+	TArray<FString> CommentTexts;
 	if (Mat)
 	{
-		Mat->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpression>(AllExpressions);
+		for (const TObjectPtr<UMaterialExpression>& E : Mat->GetExpressions())
+		{
+			if (E) Expressions.Add(E.Get());
+		}
 		for (const TObjectPtr<UMaterialExpressionComment>& Comment : Mat->GetEditorComments())
 		{
-			if (Comment)
-			{
-				AllExpressions.Add(Comment.Get());
-			}
+			if (Comment) CommentTexts.Add(Comment->Text);
 		}
 	}
 	else
 	{
-		TArrayView<const TObjectPtr<UMaterialExpression>> Exprs = MF->GetExpressions();
-		for (const TObjectPtr<UMaterialExpression>& E : Exprs)
+		for (const TObjectPtr<UMaterialExpression>& E : MF->GetExpressions())
 		{
-			AllExpressions.Add(E.Get());
+			if (E) Expressions.Add(E.Get());
 		}
 		for (const TObjectPtr<UMaterialExpressionComment>& Comment : MF->GetEditorComments())
 		{
-			if (Comment)
-			{
-				AllExpressions.Add(Comment.Get());
-			}
+			if (Comment) CommentTexts.Add(Comment->Text);
 		}
 	}
+	Expressions.Sort([](const UMaterialExpression& A, const UMaterialExpression& B)
+	{
+		return A.GetName() < B.GetName();
+	});
 
-	Data->SetStringField(TEXT("asset"), Asset->GetName());
+	Data->SetStringField(TEXT("asset"), Asset->GetPathName());
 	Data->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
-	Data->SetNumberField(TEXT("expressionCount"), AllExpressions.Num());
+	Data->SetNumberField(TEXT("expressionCount"), Expressions.Num());
 
+	// Root: what the material is, and what feeds its output pins.
+	if (Mat)
+	{
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject());
+		if (const UEnum* BlendEnum = StaticEnum<EBlendMode>())
+		{
+			Root->SetStringField(TEXT("blendMode"), BlendEnum->GetNameStringByValue((int64)Mat->GetBlendMode()));
+		}
+		FString ShadingModels;
+		if (const UEnum* ShadingEnum = StaticEnum<EMaterialShadingModel>())
+		{
+			const FMaterialShadingModelField Field = Mat->GetShadingModels();
+			for (int32 Model = 0; Model < MSM_NUM; ++Model)
+			{
+				if (Field.HasShadingModel((EMaterialShadingModel)Model))
+				{
+					if (!ShadingModels.IsEmpty()) ShadingModels += TEXT(",");
+					ShadingModels += ShadingEnum->GetNameStringByValue(Model);
+				}
+			}
+		}
+		Root->SetStringField(TEXT("shadingModels"), ShadingModels);
+		Root->SetBoolField(TEXT("twoSided"), Mat->IsTwoSided());
+		Root->SetNumberField(TEXT("opacityMaskClipValue"), Mat->GetOpacityMaskClipValue());
+		Root->SetBoolField(TEXT("tangentSpaceNormal"), Mat->bTangentSpaceNormal != 0);
+		Root->SetBoolField(TEXT("useMaterialAttributes"), Mat->bUseMaterialAttributes != 0);
+
+		struct FRootPin { EMaterialProperty Property; const TCHAR* Name; };
+		static const FRootPin RootPins[] = {
+			{ MP_MaterialAttributes, TEXT("MaterialAttributes") }, { MP_BaseColor, TEXT("BaseColor") },
+			{ MP_Metallic, TEXT("Metallic") }, { MP_Specular, TEXT("Specular") }, { MP_Roughness, TEXT("Roughness") },
+			{ MP_Anisotropy, TEXT("Anisotropy") }, { MP_EmissiveColor, TEXT("EmissiveColor") },
+			{ MP_Opacity, TEXT("Opacity") }, { MP_OpacityMask, TEXT("OpacityMask") }, { MP_Normal, TEXT("Normal") },
+			{ MP_Tangent, TEXT("Tangent") }, { MP_WorldPositionOffset, TEXT("WorldPositionOffset") },
+			{ MP_SubsurfaceColor, TEXT("SubsurfaceColor") }, { MP_AmbientOcclusion, TEXT("AmbientOcclusion") },
+			{ MP_Refraction, TEXT("Refraction") }, { MP_PixelDepthOffset, TEXT("PixelDepthOffset") },
+			{ MP_ShadingModel, TEXT("ShadingModel") },
+		};
+		TArray<TSharedPtr<FJsonValue>> RootInputs;
+		for (const FRootPin& Pin : RootPins)
+		{
+			const FExpressionInput* Input = Mat->GetExpressionInputForProperty(Pin.Property);
+			if (Input && Input->Expression)
+			{
+				RootInputs.Add(MakeShareable(new FJsonValueString(
+					FString::Printf(TEXT("%s<-%s"), Pin.Name, *OCDescribeSource(*Input)))));
+			}
+		}
+		Root->SetArrayField(TEXT("inputs"), RootInputs);
+		Data->SetObjectField(TEXT("material"), Root);
+	}
+
+	TSet<FString> FunctionPaths;
 	TArray<TSharedPtr<FJsonValue>> Nodes;
-	for (int32 NodeIdx = 0; NodeIdx < AllExpressions.Num(); ++NodeIdx)
+	for (UMaterialExpression* Expr : Expressions)
 	{
-		UMaterialExpression* Expr = AllExpressions[NodeIdx];
-		if (!Expr) continue;
-
-		TSharedPtr<FJsonObject> Node = MakeShareable(new FJsonObject());
-		Node->SetNumberField(TEXT("id"), NodeIdx);
-		Node->SetStringField(TEXT("type"), Expr->GetClass()->GetName());
-		Node->SetStringField(TEXT("desc"), Expr->Desc);
-		Node->SetNumberField(TEXT("posX"), Expr->MaterialExpressionEditorX);
-		Node->SetNumberField(TEXT("posY"), Expr->MaterialExpressionEditorY);
-
-		if (UMaterialExpressionComment* Comment = Cast<UMaterialExpressionComment>(Expr))
+		if (Expr->IsA<UMaterialExpressionComment>())
 		{
-			Node->SetStringField(TEXT("commentText"), Comment->Text);
-			Node->SetNumberField(TEXT("sizeX"), Comment->SizeX);
-			Node->SetNumberField(TEXT("sizeY"), Comment->SizeY);
+			continue;
 		}
-
-		// Function calls
-		if (UMaterialExpressionMaterialFunctionCall* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expr))
+		if (const UMaterialExpressionMaterialFunctionCall* Call = Cast<UMaterialExpressionMaterialFunctionCall>(Expr))
 		{
-			if (FuncCall->MaterialFunction)
+			if (Call->MaterialFunction)
 			{
-				Node->SetStringField(TEXT("function"), FuncCall->MaterialFunction->GetPathName());
+				FunctionPaths.Add(Call->MaterialFunction->GetOutermost()->GetName());
 			}
 		}
 
-		// Scalar params
-		if (UMaterialExpressionScalarParameter* Scalar = Cast<UMaterialExpressionScalarParameter>(Expr))
-		{
-			Node->SetStringField(TEXT("paramName"), Scalar->ParameterName.ToString());
-			Node->SetStringField(TEXT("group"), Scalar->Group.ToString());
-			Node->SetNumberField(TEXT("defaultValue"), Scalar->DefaultValue);
-		}
+		TArray<TPair<FString, FString>> Props;
+		TArray<TPair<FString, FString>> Inputs;
+		OCCollectExprProps(Expr, Props);
+		OCCollectExprInputs(Expr, Inputs);
+		const FString Name = OCShortExprName(Expr);
+		const FString Desc = Expr->Desc.Replace(TEXT("\r"), TEXT(" ")).Replace(TEXT("\n"), TEXT(" "));
 
-		// Vector params
-		if (UMaterialExpressionVectorParameter* Vec = Cast<UMaterialExpressionVectorParameter>(Expr))
+		if (bJson)
 		{
-			Node->SetStringField(TEXT("paramName"), Vec->ParameterName.ToString());
-			Node->SetStringField(TEXT("group"), Vec->Group.ToString());
-			TSharedPtr<FJsonObject> Val = MakeShareable(new FJsonObject());
-			Val->SetNumberField(TEXT("r"), Vec->DefaultValue.R);
-			Val->SetNumberField(TEXT("g"), Vec->DefaultValue.G);
-			Val->SetNumberField(TEXT("b"), Vec->DefaultValue.B);
-			Node->SetObjectField(TEXT("defaultValue"), Val);
+			TSharedPtr<FJsonObject> Node = MakeShareable(new FJsonObject());
+			Node->SetStringField(TEXT("name"), Name);
+			Node->SetStringField(TEXT("type"), Expr->GetClass()->GetName());
+			if (!Desc.IsEmpty()) Node->SetStringField(TEXT("desc"), Desc);
+			Node->SetNumberField(TEXT("x"), Expr->MaterialExpressionEditorX);
+			Node->SetNumberField(TEXT("y"), Expr->MaterialExpressionEditorY);
+			TSharedPtr<FJsonObject> PropsObj = MakeShareable(new FJsonObject());
+			for (const TPair<FString, FString>& P : Props) PropsObj->SetStringField(P.Key, P.Value);
+			Node->SetObjectField(TEXT("props"), PropsObj);
+			TSharedPtr<FJsonObject> InputsObj = MakeShareable(new FJsonObject());
+			for (const TPair<FString, FString>& In : Inputs) InputsObj->SetStringField(In.Key, In.Value);
+			Node->SetObjectField(TEXT("inputs"), InputsObj);
+			Nodes.Add(MakeShareable(new FJsonValueObject(Node)));
 		}
-
-		// Constants
-		if (UMaterialExpressionConstant* Const = Cast<UMaterialExpressionConstant>(Expr))
+		else
 		{
-			Node->SetNumberField(TEXT("r"), Const->R);
-		}
-
-		// Constants 2, 3, 4 (for RGB, RGBA constants)
-		if (UMaterialExpressionConstant2Vector* Const2 = Cast<UMaterialExpressionConstant2Vector>(Expr))
-		{
-			Node->SetNumberField(TEXT("r"), Const2->R);
-			Node->SetNumberField(TEXT("g"), Const2->G);
-		}
-		if (UMaterialExpressionConstant3Vector* Const3 = Cast<UMaterialExpressionConstant3Vector>(Expr))
-		{
-			Node->SetNumberField(TEXT("r"), Const3->Constant.R);
-			Node->SetNumberField(TEXT("g"), Const3->Constant.G);
-			Node->SetNumberField(TEXT("b"), Const3->Constant.B);
-		}
-		if (UMaterialExpressionConstant4Vector* Const4 = Cast<UMaterialExpressionConstant4Vector>(Expr))
-		{
-			Node->SetNumberField(TEXT("r"), Const4->Constant.R);
-			Node->SetNumberField(TEXT("g"), Const4->Constant.G);
-			Node->SetNumberField(TEXT("b"), Const4->Constant.B);
-			Node->SetNumberField(TEXT("a"), Const4->Constant.A);
-		}
-
-		// Static switches
-		if (UMaterialExpressionStaticSwitchParameter* Switch = Cast<UMaterialExpressionStaticSwitchParameter>(Expr))
-		{
-			Node->SetStringField(TEXT("paramName"), Switch->ParameterName.ToString());
-			Node->SetBoolField(TEXT("defaultValue"), Switch->DefaultValue);
-		}
-
-		// Texture samples
-		if (UMaterialExpressionTextureSample* TexSample = Cast<UMaterialExpressionTextureSample>(Expr))
-		{
-			if (TexSample->Texture)
+			FString Line = Name + TEXT(" | ");
+			for (int32 i = 0; i < Props.Num(); ++i)
 			{
-				Node->SetStringField(TEXT("texture"), TexSample->Texture->GetPathName());
+				if (i > 0) Line += TEXT(" ");
+				Line += Props[i].Key + TEXT("=") + Props[i].Value;
 			}
-		}
-
-		// Function input (for material functions)
-		if (UMaterialExpressionFunctionInput* FuncInput = Cast<UMaterialExpressionFunctionInput>(Expr))
-		{
-			Node->SetStringField(TEXT("inputName"), FuncInput->InputName.ToString());
-			Node->SetStringField(TEXT("inputType"), FuncInput->InputType == FunctionInput_Scalar ? TEXT("Scalar") :
-				FuncInput->InputType == FunctionInput_Vector4 ? TEXT("Vector4") :
-				FuncInput->InputType == FunctionInput_Vector3 ? TEXT("Vector3") :
-				FuncInput->InputType == FunctionInput_Vector2 ? TEXT("Vector2") :
-				FuncInput->InputType == FunctionInput_StaticBool ? TEXT("StaticBool") :
-				FuncInput->InputType == FunctionInput_Texture2D ? TEXT("Texture2D") : TEXT("Unknown"));
-			Node->SetStringField(TEXT("preview"), FuncInput->PreviewValue.ToString());
-		}
-
-		// Function output
-		if (UMaterialExpressionFunctionOutput* FuncOutput = Cast<UMaterialExpressionFunctionOutput>(Expr))
-		{
-			Node->SetStringField(TEXT("outputName"), FuncOutput->OutputName.ToString());
-		}
-
-		// Common binary ops (Add, Multiply)
-		if (UMaterialExpressionAdd* Add = Cast<UMaterialExpressionAdd>(Expr))
-		{
-			Node->SetNumberField(TEXT("constA"), Add->ConstA);
-			Node->SetNumberField(TEXT("constB"), Add->ConstB);
-		}
-		if (UMaterialExpressionMultiply* Mul = Cast<UMaterialExpressionMultiply>(Expr))
-		{
-			Node->SetNumberField(TEXT("constA"), Mul->ConstA);
-			Node->SetNumberField(TEXT("constB"), Mul->ConstB);
-		}
-
-		Nodes.Add(MakeShareable(new FJsonValueObject(Node)));
-	}
-
-	Data->SetArrayField(TEXT("expressions"), Nodes);
-
-	// Build expression-to-ID map for connection lookups
-	TMap<UMaterialExpression*, int32> ExprToId;
-	for (int32 i = 0; i < AllExpressions.Num(); ++i)
-	{
-		if (AllExpressions[i])
-		{
-			ExprToId.Add(AllExpressions[i], i);
+			Line += TEXT(" | ");
+			for (int32 i = 0; i < Inputs.Num(); ++i)
+			{
+				if (i > 0) Line += TEXT(", ");
+				Line += Inputs[i].Key + TEXT("<-") + Inputs[i].Value;
+			}
+			if (!Desc.IsEmpty())
+			{
+				Line += TEXT(" // ") + Desc;
+			}
+			Nodes.Add(MakeShareable(new FJsonValueString(Line)));
 		}
 	}
+	Data->SetStringField(TEXT("nodeFormat"), bJson
+		? TEXT("json")
+		: TEXT("Name | Prop=Value (non-default only) | Pin<-Source.Output // desc"));
+	Data->SetArrayField(TEXT("nodes"), Nodes);
 
-	// Add connections for each node
-	for (int32 i = 0; i < (int32)Nodes.Num(); ++i)
+	TArray<FString> SortedFunctions = FunctionPaths.Array();
+	SortedFunctions.Sort();
+	TArray<TSharedPtr<FJsonValue>> Functions;
+	for (const FString& Path : SortedFunctions)
 	{
-		TSharedPtr<FJsonObject> Node = Nodes[i]->AsObject();
-		if (!Node || i >= AllExpressions.Num() || !AllExpressions[i]) continue;
-
-		TArray<TSharedPtr<FJsonValue>> Connections;
-
-		for (TFieldIterator<FStructProperty> PropIt(AllExpressions[i]->GetClass(), EFieldIteratorFlags::IncludeSuper); PropIt; ++PropIt)
-		{
-			FStructProperty* Prop = *PropIt;
-			if (!Prop || !Prop->Struct) continue;
-
-			FName StructName = Prop->Struct->GetFName();
-			if (StructName != FName(TEXT("ExpressionInput")) && StructName != FName(TEXT("MaterialInput"))) continue;
-
-			FExpressionInput* Input = Prop->ContainerPtrToValuePtr<FExpressionInput>(AllExpressions[i]);
-			if (!Input || !Input->Expression) continue;
-
-			int32* FoundId = ExprToId.Find(Input->Expression);
-			if (!FoundId) continue;
-
-			TSharedPtr<FJsonObject> Conn = MakeShareable(new FJsonObject());
-			FString PinName = Input->InputName.IsNone() ? Prop->GetName() : Input->InputName.ToString();
-			Conn->SetStringField(TEXT("inputName"), PinName);
-			Conn->SetNumberField(TEXT("sourceId"), *FoundId);
-			Conn->SetNumberField(TEXT("sourceOutput"), Input->OutputIndex);
-			if (Input->Mask != 0)
-			{
-				Conn->SetNumberField(TEXT("mask"), Input->Mask);
-			}
-			if (Input->MaskR != 0)
-			{
-				Conn->SetBoolField(TEXT("maskR"), Input->MaskR != 0);
-			}
-			if (Input->MaskG != 0)
-			{
-				Conn->SetBoolField(TEXT("maskG"), Input->MaskG != 0);
-			}
-			if (Input->MaskB != 0)
-			{
-				Conn->SetBoolField(TEXT("maskB"), Input->MaskB != 0);
-			}
-			if (Input->MaskA != 0)
-			{
-				Conn->SetBoolField(TEXT("maskA"), Input->MaskA != 0);
-			}
-			Connections.Add(MakeShareable(new FJsonValueObject(Conn)));
-		}
-		if (Connections.Num() > 0)
-		{
-			Node->SetArrayField(TEXT("connections"), Connections);
-		}
+		Functions.Add(MakeShareable(new FJsonValueString(Path)));
 	}
+	Data->SetArrayField(TEXT("functions"), Functions);
+
+	TArray<TSharedPtr<FJsonValue>> Comments;
+	for (const FString& Text : CommentTexts)
+	{
+		Comments.Add(MakeShareable(new FJsonValueString(Text.Replace(TEXT("\r"), TEXT(" ")).Replace(TEXT("\n"), TEXT(" ")))));
+	}
+	Data->SetArrayField(TEXT("comments"), Comments);
 
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }
@@ -1847,5 +2237,892 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleRunPython(const FOpenCodeRequest& 
 	return FOpenCodeResponse::Success(Request.Id, Data);
 #else
 	return FOpenCodeResponse::Failure(Request.Id, TEXT("run_python requires an editor build"));
+#endif
+}
+
+// ======================= TOOLS ADDED AFTER THE HEADER =======================
+// Free functions rather than class members, so the header (and every other
+// translation unit) stays untouched and a Live Coding patch can add them.
+
+// Reflected properties of an object as strings: those that differ from the
+// class default, plus any named in `Always`. Properties declared by `StopAt`
+// or its bases are skipped (pass USceneComponent to drop transform noise).
+static void OCExportObjectProps(const UObject* Obj, const UClass* StopAt, const TSet<FName>& Always, const TSharedPtr<FJsonObject>& Out)
+{
+	if (!Obj)
+	{
+		return;
+	}
+	const UObject* CDO = Obj->GetClass()->GetDefaultObject();
+	for (TFieldIterator<FProperty> It(Obj->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		FProperty* Prop = *It;
+		const UClass* Owner = Prop ? Prop->GetOwnerClass() : nullptr;
+		if (!Owner || (StopAt && StopAt->IsChildOf(Owner)))
+		{
+			continue;
+		}
+		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated | CPF_DuplicateTransient))
+		{
+			continue;
+		}
+		if (CastField<FDelegateProperty>(Prop) || CastField<FMulticastDelegateProperty>(Prop))
+		{
+			continue;
+		}
+		// Bookkeeping that says nothing about how the asset behaves.
+		static const TSet<FName> Noise = {
+			FName(TEXT("Source")), FName(TEXT("LightingGuid")), FName(TEXT("AssetImportData")),
+			FName(TEXT("AssetUserData")), FName(TEXT("ImportedSize")),
+		};
+		if (Noise.Contains(Prop->GetFName()))
+		{
+			continue;
+		}
+		const bool bAlways = Always.Contains(Prop->GetFName());
+		if (!bAlways && CDO && Prop->Identical_InContainer(Obj, CDO))
+		{
+			continue;
+		}
+
+		FString Value;
+		if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			Value = BoolProp->GetPropertyValue_InContainer(Obj) ? TEXT("true") : TEXT("false");
+		}
+		else if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			const UObject* Ref = ObjProp->GetObjectPropertyValue_InContainer(Obj);
+			Value = Ref ? Ref->GetPathName() : FString(TEXT("None"));
+		}
+		else
+		{
+			Prop->ExportText_InContainer(0, Value, Obj, Obj, const_cast<UObject*>(Obj), PPF_None);
+		}
+		if (Value.Len() > 300)
+		{
+			Value = Value.Left(300) + TEXT("...");
+		}
+		Out->SetStringField(Prop->GetName(), Value);
+	}
+}
+
+static double OCRound(double Value, double Scale)
+{
+	return FMath::RoundToDouble(Value * Scale) / Scale;
+}
+
+static TSharedPtr<FJsonValue> OCNum(double Value, double Scale)
+{
+	return MakeShareable(new FJsonValueNumber(OCRound(Value, Scale)));
+}
+
+// ---- get_static_mesh_data ----------------------------------------------------
+// args: assetPath, lod (default 0), includeData (default false), includeNormals.
+// Without includeData: bounds, material slots and per-LOD counts / screen sizes.
+// With it: the LOD's render vertices (positions, every UV channel, optionally
+// normals) and triangle indices, as flat arrays — pair with outputFile.
+static FOpenCodeResponse OCHandleGetStaticMeshData(const FOpenCodeRequest& Request)
+{
+	FString AssetPath;
+	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+	int32 Lod = 0;
+	Request.Args->TryGetNumberField(TEXT("lod"), Lod);
+	bool bIncludeData = false;
+	Request.Args->TryGetBoolField(TEXT("includeData"), bIncludeData);
+	bool bIncludeNormals = false;
+	Request.Args->TryGetBoolField(TEXT("includeNormals"), bIncludeNormals);
+
+	UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *AssetPath));
+	if (!Mesh)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("StaticMesh not found: %s"), *AssetPath));
+	}
+	const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
+	if (!RenderData || RenderData->LODResources.Num() == 0)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("The mesh has no render data"));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("asset"), Mesh->GetPathName());
+	Data->SetStringField(TEXT("units"), TEXT("UE centimeters, Z-up, local mesh space"));
+
+	const FBoxSphereBounds Bounds = Mesh->GetBounds();
+	TSharedPtr<FJsonObject> BoundsObj = MakeShareable(new FJsonObject());
+	BoundsObj->SetStringField(TEXT("origin"), Bounds.Origin.ToString());
+	BoundsObj->SetStringField(TEXT("boxExtent"), Bounds.BoxExtent.ToString());
+	BoundsObj->SetNumberField(TEXT("sphereRadius"), Bounds.SphereRadius);
+	Data->SetObjectField(TEXT("bounds"), BoundsObj);
+
+	TArray<TSharedPtr<FJsonValue>> Materials;
+	for (const FStaticMaterial& Slot : Mesh->GetStaticMaterials())
+	{
+		TSharedPtr<FJsonObject> SlotObj = MakeShareable(new FJsonObject());
+		SlotObj->SetStringField(TEXT("slot"), Slot.MaterialSlotName.ToString());
+		SlotObj->SetStringField(TEXT("material"), Slot.MaterialInterface ? Slot.MaterialInterface->GetPathName() : FString());
+		Materials.Add(MakeShareable(new FJsonValueObject(SlotObj)));
+	}
+	Data->SetArrayField(TEXT("materials"), Materials);
+
+	TArray<TSharedPtr<FJsonValue>> Lods;
+	for (int32 LodIndex = 0; LodIndex < RenderData->LODResources.Num(); ++LodIndex)
+	{
+		const FStaticMeshLODResources& LodRes = RenderData->LODResources[LodIndex];
+		TSharedPtr<FJsonObject> LodObj = MakeShareable(new FJsonObject());
+		LodObj->SetNumberField(TEXT("lod"), LodIndex);
+		LodObj->SetNumberField(TEXT("vertices"), LodRes.GetNumVertices());
+		LodObj->SetNumberField(TEXT("triangles"), LodRes.GetNumTriangles());
+		LodObj->SetNumberField(TEXT("uvChannels"), LodRes.GetNumTexCoords());
+		LodObj->SetNumberField(TEXT("screenSize"), RenderData->ScreenSize[LodIndex].GetValue());
+		TArray<TSharedPtr<FJsonValue>> Sections;
+		for (const FStaticMeshSection& Section : LodRes.Sections)
+		{
+			TSharedPtr<FJsonObject> SectionObj = MakeShareable(new FJsonObject());
+			SectionObj->SetNumberField(TEXT("materialIndex"), Section.MaterialIndex);
+			SectionObj->SetNumberField(TEXT("triangles"), Section.NumTriangles);
+			SectionObj->SetNumberField(TEXT("firstIndex"), Section.FirstIndex);
+			Sections.Add(MakeShareable(new FJsonValueObject(SectionObj)));
+		}
+		LodObj->SetArrayField(TEXT("sections"), Sections);
+		Lods.Add(MakeShareable(new FJsonValueObject(LodObj)));
+	}
+	Data->SetArrayField(TEXT("lods"), Lods);
+
+	if (bIncludeData)
+	{
+		if (!RenderData->LODResources.IsValidIndex(Lod))
+		{
+			return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("LOD %d does not exist (the mesh has %d)"), Lod, RenderData->LODResources.Num()));
+		}
+		const FStaticMeshLODResources& LodRes = RenderData->LODResources[Lod];
+		const FPositionVertexBuffer& Positions = LodRes.VertexBuffers.PositionVertexBuffer;
+		const FStaticMeshVertexBuffer& Vertices = LodRes.VertexBuffers.StaticMeshVertexBuffer;
+		const int32 NumVerts = (int32)Positions.GetNumVertices();
+		if (NumVerts == 0 || Positions.GetVertexData() == nullptr || (int32)Vertices.GetNumVertices() != NumVerts)
+		{
+			return FOpenCodeResponse::Failure(Request.Id, TEXT("The LOD's vertex data is not available on the CPU"));
+		}
+
+		TSharedPtr<FJsonObject> Geo = MakeShareable(new FJsonObject());
+		Geo->SetNumberField(TEXT("lod"), Lod);
+		Geo->SetStringField(TEXT("layout"), TEXT("positions: xyz per vertex; uvs[channel]: uv per vertex; normals: xyz per vertex; indices: 3 per triangle"));
+
+		TArray<TSharedPtr<FJsonValue>> PosArray;
+		PosArray.Reserve(NumVerts * 3);
+		for (int32 i = 0; i < NumVerts; ++i)
+		{
+			const FVector3f& P = Positions.VertexPosition(i);
+			PosArray.Add(OCNum(P.X, 10000.0));
+			PosArray.Add(OCNum(P.Y, 10000.0));
+			PosArray.Add(OCNum(P.Z, 10000.0));
+		}
+		Geo->SetArrayField(TEXT("positions"), PosArray);
+
+		TArray<TSharedPtr<FJsonValue>> UvChannels;
+		const int32 NumUVs = (int32)Vertices.GetNumTexCoords();
+		for (int32 Channel = 0; Channel < NumUVs; ++Channel)
+		{
+			TArray<TSharedPtr<FJsonValue>> UvArray;
+			UvArray.Reserve(NumVerts * 2);
+			for (int32 i = 0; i < NumVerts; ++i)
+			{
+				const FVector2f UV = Vertices.GetVertexUV(i, Channel);
+				UvArray.Add(OCNum(UV.X, 1000000.0));
+				UvArray.Add(OCNum(UV.Y, 1000000.0));
+			}
+			UvChannels.Add(MakeShareable(new FJsonValueArray(UvArray)));
+		}
+		Geo->SetArrayField(TEXT("uvs"), UvChannels);
+
+		if (bIncludeNormals)
+		{
+			TArray<TSharedPtr<FJsonValue>> NormalArray;
+			NormalArray.Reserve(NumVerts * 3);
+			for (int32 i = 0; i < NumVerts; ++i)
+			{
+				const FVector4f N = Vertices.VertexTangentZ(i);
+				NormalArray.Add(OCNum(N.X, 10000.0));
+				NormalArray.Add(OCNum(N.Y, 10000.0));
+				NormalArray.Add(OCNum(N.Z, 10000.0));
+			}
+			Geo->SetArrayField(TEXT("normals"), NormalArray);
+		}
+
+		TArray<uint32> Indices;
+		LodRes.IndexBuffer.GetCopy(Indices);
+		TArray<TSharedPtr<FJsonValue>> IndexArray;
+		IndexArray.Reserve(Indices.Num());
+		for (uint32 Index : Indices)
+		{
+			IndexArray.Add(MakeShareable(new FJsonValueNumber((double)Index)));
+		}
+		Geo->SetArrayField(TEXT("indices"), IndexArray);
+		Data->SetObjectField(TEXT("geometry"), Geo);
+	}
+
+	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+// ---- get_texture_info --------------------------------------------------------
+// What the GPU actually samples (format, size, mips, alpha), the import
+// settings that decide it, and per-channel min/max/mean of the source image —
+// so "is the alpha channel real data?" is a lookup, not a guess.
+static FOpenCodeResponse OCHandleGetTextureInfo(const FOpenCodeRequest& Request)
+{
+	FString AssetPath;
+	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+	bool bStats = true;
+	Request.Args->TryGetBoolField(TEXT("channelStats"), bStats);
+
+	UTexture* Texture = Cast<UTexture>(StaticLoadObject(UTexture::StaticClass(), nullptr, *AssetPath));
+	if (!Texture)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Texture not found: %s"), *AssetPath));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("asset"), Texture->GetPathName());
+	Data->SetStringField(TEXT("class"), Texture->GetClass()->GetName());
+
+	if (const UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
+	{
+		TSharedPtr<FJsonObject> Runtime = MakeShareable(new FJsonObject());
+		Runtime->SetNumberField(TEXT("width"), Texture2D->GetSizeX());
+		Runtime->SetNumberField(TEXT("height"), Texture2D->GetSizeY());
+		Runtime->SetNumberField(TEXT("mips"), Texture2D->GetNumMips());
+		Runtime->SetStringField(TEXT("pixelFormat"), GetPixelFormatString(Texture2D->GetPixelFormat()));
+		Runtime->SetBoolField(TEXT("hasAlphaChannel"), Texture2D->HasAlphaChannel());
+		Data->SetObjectField(TEXT("runtime"), Runtime);
+	}
+
+	static const TSet<FName> Always = {
+		FName(TEXT("CompressionSettings")), FName(TEXT("SRGB")), FName(TEXT("LODGroup")), FName(TEXT("MaxTextureSize")),
+		FName(TEXT("LODBias")), FName(TEXT("Filter")), FName(TEXT("MipGenSettings")), FName(TEXT("CompressionNoAlpha")),
+		FName(TEXT("AddressX")), FName(TEXT("AddressY")), FName(TEXT("NeverStream")), FName(TEXT("VirtualTextureStreaming")),
+		FName(TEXT("bFlipGreenChannel")),
+	};
+	TSharedPtr<FJsonObject> Settings = MakeShareable(new FJsonObject());
+	OCExportObjectProps(Texture, UObject::StaticClass(), Always, Settings);
+	Data->SetObjectField(TEXT("settings"), Settings);
+
+	const FTextureSource& Source = Texture->Source;
+	if (Source.IsValid())
+	{
+		TSharedPtr<FJsonObject> SourceObj = MakeShareable(new FJsonObject());
+		const ETextureSourceFormat Format = Source.GetFormat();
+		const int64 Width = Source.GetSizeX();
+		const int64 Height = Source.GetSizeY();
+		SourceObj->SetNumberField(TEXT("width"), (double)Width);
+		SourceObj->SetNumberField(TEXT("height"), (double)Height);
+		SourceObj->SetNumberField(TEXT("mips"), Source.GetNumMips());
+		if (const UEnum* FormatEnum = StaticEnum<ETextureSourceFormat>())
+		{
+			SourceObj->SetStringField(TEXT("format"), FormatEnum->GetNameStringByValue((int64)Format));
+		}
+
+		// Channel layout of the formats worth reading; anything else is skipped.
+		int32 NumChannels = 0;
+		int32 BytesPerChannel = 0;
+		bool bFloat = false;
+		bool bBgra = false;
+		switch (Format)
+		{
+		case TSF_G8:      NumChannels = 1; BytesPerChannel = 1; break;
+		case TSF_BGRA8:   NumChannels = 4; BytesPerChannel = 1; bBgra = true; break;
+		case TSF_G16:     NumChannels = 1; BytesPerChannel = 2; break;
+		case TSF_RGBA16:  NumChannels = 4; BytesPerChannel = 2; break;
+		case TSF_RGBA16F: NumChannels = 4; BytesPerChannel = 2; bFloat = true; break;
+		case TSF_RGBA32F: NumChannels = 4; BytesPerChannel = 4; bFloat = true; break;
+		default: break;
+		}
+
+		TArray64<uint8> Mip;
+		if (bStats && NumChannels > 0 && Width > 0 && Height > 0
+			&& const_cast<FTextureSource&>(Source).GetMipData(Mip, 0)
+			&& Mip.Num() >= Width * Height * NumChannels * BytesPerChannel)
+		{
+			double Min[4] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
+			double Max[4] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
+			double Sum[4] = { 0.0, 0.0, 0.0, 0.0 };
+			const int64 NumPixels = Width * Height;
+			const uint8* Bytes = Mip.GetData();
+			for (int64 Pixel = 0; Pixel < NumPixels; ++Pixel)
+			{
+				for (int32 Channel = 0; Channel < NumChannels; ++Channel)
+				{
+					const uint8* At = Bytes + (Pixel * NumChannels + Channel) * BytesPerChannel;
+					double Value = 0.0;
+					if (bFloat && BytesPerChannel == 2)
+					{
+						FFloat16 Half;
+						FMemory::Memcpy(&Half.Encoded, At, 2);
+						Value = Half.GetFloat();
+					}
+					else if (bFloat)
+					{
+						float F;
+						FMemory::Memcpy(&F, At, 4);
+						Value = F;
+					}
+					else if (BytesPerChannel == 2)
+					{
+						uint16 V;
+						FMemory::Memcpy(&V, At, 2);
+						Value = V / 65535.0;
+					}
+					else
+					{
+						Value = *At / 255.0;
+					}
+					// Report in RGBA order whatever the storage order.
+					const int32 Out = (bBgra && Channel < 3) ? 2 - Channel : Channel;
+					Min[Out] = FMath::Min(Min[Out], Value);
+					Max[Out] = FMath::Max(Max[Out], Value);
+					Sum[Out] += Value;
+				}
+			}
+			static const TCHAR* Names[4] = { TEXT("r"), TEXT("g"), TEXT("b"), TEXT("a") };
+			TSharedPtr<FJsonObject> Stats = MakeShareable(new FJsonObject());
+			for (int32 Channel = 0; Channel < NumChannels; ++Channel)
+			{
+				TSharedPtr<FJsonObject> ChannelObj = MakeShareable(new FJsonObject());
+				ChannelObj->SetNumberField(TEXT("min"), OCRound(Min[Channel], 10000.0));
+				ChannelObj->SetNumberField(TEXT("max"), OCRound(Max[Channel], 10000.0));
+				ChannelObj->SetNumberField(TEXT("mean"), OCRound(Sum[Channel] / (double)NumPixels, 10000.0));
+				Stats->SetObjectField(NumChannels == 1 ? TEXT("grey") : Names[Channel], ChannelObj);
+			}
+			SourceObj->SetObjectField(TEXT("channelStats"), Stats);
+			SourceObj->SetStringField(TEXT("channelStatsNote"), TEXT("source values, 0..1 for integer formats, before sRGB decode"));
+		}
+		Data->SetObjectField(TEXT("source"), SourceObj);
+	}
+
+	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+// ---- get_level_lighting ------------------------------------------------------
+// Everything that decides how the level is lit and graded, in one reply: the
+// directional/sky lights, height fog, sky atmosphere, post-process volumes
+// (only the settings each one overrides) and the renderer switches that matter.
+static FOpenCodeResponse OCHandleGetLevelLighting(const FOpenCodeRequest& Request)
+{
+	UWorld* World = nullptr;
+#if WITH_EDITOR
+	if (GEditor)
+	{
+		World = GEditor->GetEditorWorldContext().World();
+	}
+#endif
+	if (!World)
+	{
+		World = GWorld;
+	}
+	if (!World)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("No world is loaded"));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("level"), World->GetOutermost()->GetName());
+
+	static const TSet<FName> LightAlways = {
+		FName(TEXT("Intensity")), FName(TEXT("LightColor")), FName(TEXT("bUseTemperature")), FName(TEXT("Temperature")),
+		FName(TEXT("CastShadows")), FName(TEXT("IndirectLightingIntensity")), FName(TEXT("LightSourceAngle")),
+		FName(TEXT("DynamicShadowDistanceMovableLight")), FName(TEXT("DynamicShadowCascades")),
+		FName(TEXT("bAtmosphereSunLight")), FName(TEXT("SourceType")), FName(TEXT("bRealTimeCapture")),
+		FName(TEXT("bLowerHemisphereIsBlack")), FName(TEXT("LowerHemisphereColor")),
+	};
+	static const TSet<FName> FogAlways = {
+		FName(TEXT("FogDensity")), FName(TEXT("FogHeightFalloff")), FName(TEXT("FogInscatteringLuminance")),
+		FName(TEXT("FogMaxOpacity")), FName(TEXT("StartDistance")), FName(TEXT("bEnableVolumetricFog")),
+	};
+	static const TSet<FName> None;
+
+	TArray<TSharedPtr<FJsonValue>> DirectionalLights, SkyLights, Fogs, Atmospheres, LocalLights, Volumes;
+	int32 LocalLightCount = 0;
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor)
+		{
+			continue;
+		}
+#if WITH_EDITOR
+		const FString Label = Actor->GetActorLabel();
+#else
+		const FString Label = Actor->GetName();
+#endif
+
+		TInlineComponentArray<USceneComponent*> Components(Actor);
+		for (USceneComponent* Component : Components)
+		{
+			if (!Component)
+			{
+				continue;
+			}
+			TSharedPtr<FJsonObject> Entry = MakeShareable(new FJsonObject());
+			Entry->SetStringField(TEXT("actor"), Label);
+			Entry->SetStringField(TEXT("class"), Component->GetClass()->GetName());
+			const TSet<FName>* Always = nullptr;
+			TArray<TSharedPtr<FJsonValue>>* Bucket = nullptr;
+
+			if (Component->IsA<UDirectionalLightComponent>())
+			{
+				const FRotator Rotation = Component->GetComponentRotation();
+				const FVector Forward = Component->GetForwardVector();
+				Entry->SetStringField(TEXT("rotation"), FString::Printf(TEXT("pitch=%.2f yaw=%.2f roll=%.2f"), Rotation.Pitch, Rotation.Yaw, Rotation.Roll));
+				Entry->SetStringField(TEXT("lightTravelDirection"), FString::Printf(TEXT("%.4f, %.4f, %.4f"), Forward.X, Forward.Y, Forward.Z));
+				Always = &LightAlways;
+				Bucket = &DirectionalLights;
+			}
+			else if (Component->IsA<USkyLightComponent>())
+			{
+				Always = &LightAlways;
+				Bucket = &SkyLights;
+			}
+			else if (Component->IsA<UExponentialHeightFogComponent>())
+			{
+				Entry->SetNumberField(TEXT("heightZ"), Component->GetComponentLocation().Z);
+				Always = &FogAlways;
+				Bucket = &Fogs;
+			}
+			else if (Component->IsA<USkyAtmosphereComponent>())
+			{
+				Always = &None;
+				Bucket = &Atmospheres;
+			}
+			else if (Component->IsA<ULocalLightComponent>())
+			{
+				++LocalLightCount;
+				if (LocalLights.Num() < 32)
+				{
+					const FVector Location = Component->GetComponentLocation();
+					Entry->SetStringField(TEXT("location"), FString::Printf(TEXT("%.1f, %.1f, %.1f"), Location.X, Location.Y, Location.Z));
+					Always = &LightAlways;
+					Bucket = &LocalLights;
+				}
+			}
+
+			if (Bucket && Always)
+			{
+				TSharedPtr<FJsonObject> Props = MakeShareable(new FJsonObject());
+				OCExportObjectProps(Component, USceneComponent::StaticClass(), *Always, Props);
+				Entry->SetObjectField(TEXT("settings"), Props);
+				Bucket->Add(MakeShareable(new FJsonValueObject(Entry)));
+			}
+		}
+
+		if (APostProcessVolume* Volume = Cast<APostProcessVolume>(Actor))
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShareable(new FJsonObject());
+			Entry->SetStringField(TEXT("actor"), Label);
+			Entry->SetBoolField(TEXT("enabled"), Volume->bEnabled != 0);
+			Entry->SetBoolField(TEXT("unbound"), Volume->bUnbound != 0);
+			Entry->SetNumberField(TEXT("blendWeight"), Volume->BlendWeight);
+			Entry->SetNumberField(TEXT("priority"), Volume->Priority);
+
+			// Only what this volume overrides: bOverride_X set means X is live.
+			TSharedPtr<FJsonObject> Overrides = MakeShareable(new FJsonObject());
+			const UScriptStruct* SettingsStruct = FPostProcessSettings::StaticStruct();
+			for (TFieldIterator<FProperty> PropIt(SettingsStruct); PropIt; ++PropIt)
+			{
+				const FBoolProperty* Flag = CastField<FBoolProperty>(*PropIt);
+				if (!Flag || !Flag->GetName().StartsWith(TEXT("bOverride_")) || !Flag->GetPropertyValue_InContainer(&Volume->Settings))
+				{
+					continue;
+				}
+				const FString SettingName = Flag->GetName().RightChop(10);
+				if (const FProperty* Setting = SettingsStruct->FindPropertyByName(FName(*SettingName)))
+				{
+					FString Value;
+					Setting->ExportText_InContainer(0, Value, &Volume->Settings, &Volume->Settings, nullptr, PPF_None);
+					Overrides->SetStringField(SettingName, Value);
+				}
+			}
+			Entry->SetObjectField(TEXT("overrides"), Overrides);
+			Volumes.Add(MakeShareable(new FJsonValueObject(Entry)));
+		}
+	}
+
+	Data->SetArrayField(TEXT("directionalLights"), DirectionalLights);
+	Data->SetArrayField(TEXT("skyLights"), SkyLights);
+	Data->SetArrayField(TEXT("heightFog"), Fogs);
+	Data->SetArrayField(TEXT("skyAtmosphere"), Atmospheres);
+	Data->SetArrayField(TEXT("postProcessVolumes"), Volumes);
+	Data->SetNumberField(TEXT("localLightCount"), LocalLightCount);
+	Data->SetArrayField(TEXT("localLights"), LocalLights);
+
+	static const TCHAR* CVarNames[] = {
+		TEXT("r.DynamicGlobalIlluminationMethod"), TEXT("r.ReflectionMethod"), TEXT("r.Shadow.Virtual.Enable"),
+		TEXT("r.AntiAliasingMethod"), TEXT("r.DefaultFeature.AutoExposure"), TEXT("r.DefaultFeature.AutoExposure.Method"),
+		TEXT("r.DefaultFeature.AutoExposure.Bias"), TEXT("r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange"),
+		TEXT("r.DefaultFeature.Bloom"), TEXT("r.DefaultFeature.AmbientOcclusion"), TEXT("r.Tonemapper.Sharpen"),
+		TEXT("r.SkyAtmosphere"), TEXT("r.VolumetricFog"), TEXT("r.GenerateMeshDistanceFields"), TEXT("r.ForwardShading"),
+		TEXT("grass.DensityScale"), TEXT("grass.CullDistanceScale"), TEXT("foliage.DensityScale"),
+		TEXT("sg.ShadowQuality"), TEXT("sg.PostProcessQuality"), TEXT("sg.FoliageQuality"), TEXT("sg.GlobalIlluminationQuality"),
+	};
+	TSharedPtr<FJsonObject> CVars = MakeShareable(new FJsonObject());
+	for (const TCHAR* Name : CVarNames)
+	{
+		if (const IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			CVars->SetStringField(Name, Var->GetString());
+		}
+	}
+	Data->SetObjectField(TEXT("cvars"), CVars);
+
+	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+// ---- get_material_hlsl -------------------------------------------------------
+// The HLSL Unreal generates for a Material or MaterialInstance, with every
+// static switch already resolved for that asset — the exact shader, where the
+// node graph is only the recipe. section "generated" (default) returns just the
+// functions the translator writes; "full" the whole material template.
+static FString OCExtractHlslFunction(const FString& Source, const TCHAR* Signature)
+{
+	int32 SearchFrom = 0;
+	for (;;)
+	{
+		const int32 At = Source.Find(Signature, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchFrom);
+		if (At == INDEX_NONE)
+		{
+			return FString();
+		}
+		const int32 Open = Source.Find(TEXT("{"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At);
+		const int32 Semicolon = Source.Find(TEXT(";"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At);
+		if (Open == INDEX_NONE)
+		{
+			return FString();
+		}
+		if (Semicolon != INDEX_NONE && Semicolon < Open)
+		{
+			SearchFrom = Semicolon + 1;   // a forward declaration; keep looking for the body
+			continue;
+		}
+		int32 LineStart = At;
+		while (LineStart > 0 && Source[LineStart - 1] != TEXT('\n'))
+		{
+			--LineStart;
+		}
+		int32 Depth = 0;
+		for (int32 i = Open; i < Source.Len(); ++i)
+		{
+			if (Source[i] == TEXT('{'))
+			{
+				++Depth;
+			}
+			else if (Source[i] == TEXT('}') && --Depth == 0)
+			{
+				return Source.Mid(LineStart, i - LineStart + 1);
+			}
+		}
+		return FString();
+	}
+}
+
+static FOpenCodeResponse OCHandleGetMaterialHlsl(const FOpenCodeRequest& Request)
+{
+	FString AssetPath;
+	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+	FString Section = TEXT("generated");
+	Request.Args->TryGetStringField(TEXT("section"), Section);
+
+	UMaterialInterface* Material = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *AssetPath));
+	if (!Material)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Material or MaterialInstance not found: %s"), *AssetPath));
+	}
+#if WITH_EDITOR
+	// The editor world's feature level (asking the RHI global would need a
+	// module this one does not link).
+	ERHIFeatureLevel::Type FeatureLevel = ERHIFeatureLevel::SM5;
+	if (GEditor)
+	{
+		if (const UWorld* World = GEditor->GetEditorWorldContext().World())
+		{
+			FeatureLevel = World->GetFeatureLevel();
+		}
+	}
+	FMaterialResource* Resource = Material->GetMaterialResource(FeatureLevel);
+	FString Source;
+	if (!Resource || !Resource->GetMaterialExpressionSource(Source) || Source.IsEmpty())
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("Unreal could not translate this material to HLSL (does it compile?)"));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("asset"), Material->GetPathName());
+	Data->SetNumberField(TEXT("fullSourceChars"), Source.Len());
+
+	FString Text;
+	if (!Section.Equals(TEXT("full"), ESearchCase::IgnoreCase))
+	{
+		static const TCHAR* Signatures[] = {
+			TEXT("float3 GetMaterialWorldPositionOffsetRaw("),
+			TEXT("float3 GetMaterialPreviousWorldPositionOffsetRaw("),
+			TEXT("void GetMaterialCustomizedUVs("),
+			TEXT("void GetCustomInterpolators("),
+			TEXT("void CalcPixelMaterialInputs("),
+		};
+		for (const TCHAR* Signature : Signatures)
+		{
+			const FString Function = OCExtractHlslFunction(Source, Signature);
+			if (!Function.IsEmpty())
+			{
+				Text += Function;
+				Text += TEXT("\n\n");
+			}
+		}
+	}
+	if (Text.IsEmpty())
+	{
+		Text = Source;
+		Section = TEXT("full");
+	}
+	Data->SetStringField(TEXT("section"), Section);
+	Data->SetStringField(TEXT("note"), TEXT("Parameters appear as Material.PreshaderBuffer[n] slots; get_material_parameters has their values. Static switches are already resolved."));
+	Data->SetStringField(TEXT("text"), Text);
+	return FOpenCodeResponse::Success(Request.Id, Data);
+#else
+	return FOpenCodeResponse::Failure(Request.Id, TEXT("Editor only"));
+#endif
+}
+
+// ---- export_asset_text -------------------------------------------------------
+// Any asset as T3D text: every sub-object with every non-default property.
+// For what no dedicated tool covers (material instances, grass types, ...).
+static FOpenCodeResponse OCHandleExportAssetText(const FOpenCodeRequest& Request)
+{
+	FString AssetPath;
+	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath);
+	if (!Asset)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
+	}
+	UExporter* Exporter = UExporter::FindExporter(Asset, TEXT("T3D"));
+	if (!Exporter)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("No T3D exporter accepts this asset"));
+	}
+	const FString Directory = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("OpenCodeBridge"));
+	IFileManager::Get().MakeDirectory(*Directory, true);
+	const FString File = Directory / (Asset->GetName() + TEXT(".t3d"));
+	FString Text;
+	if (UExporter::ExportToFile(Asset, Exporter, *File, false, false, false) != 1 || !FFileHelper::LoadFileToString(Text, *File))
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("T3D export failed"));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("asset"), Asset->GetPathName());
+	Data->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
+	Data->SetStringField(TEXT("exportedTo"), File);
+	Data->SetNumberField(TEXT("chars"), Text.Len());
+	Data->SetStringField(TEXT("text"), Text);
+	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+// ---- live_compile ------------------------------------------------------------
+// Runs a Live Coding compile and waits for it.
+//
+// When it fails, Live Coding shows the compiler's errors only in its own
+// console window: neither log file gets them. So on failure this re-runs the
+// compiler on each source file that is newer than its Live Coding object, with
+// the same response file Live Coding uses, and returns what it prints.
+static void OCDiagnoseFailedCompile(TArray<TSharedPtr<FJsonValue>>& OutDiagnostics)
+{
+	TArray<FString> SearchRoots;
+	SearchRoots.Add(FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir()));
+	for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetEnabledPlugins())
+	{
+		if (Plugin->GetType() == EPluginType::Project)
+		{
+			SearchRoots.Add(FPaths::ConvertRelativePathToFull(Plugin->GetBaseDir() / TEXT("Intermediate")));
+		}
+	}
+
+	const FString WorkingDir = FPaths::ConvertRelativePathToFull(FPaths::EngineSourceDir());
+	const FString ScratchDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("OpenCodeBridge"));
+	IFileManager& Files = IFileManager::Get();
+	Files.MakeDirectory(*ScratchDir, true);
+
+	int32 Checked = 0;
+	for (const FString& Root : SearchRoots)
+	{
+		TArray<FString> ResponseFiles;
+		Files.FindFilesRecursive(ResponseFiles, *Root, TEXT("*.rsp.lc"), true, false);
+		for (const FString& ResponseFile : ResponseFiles)
+		{
+			if (Checked >= 3 || !ResponseFile.EndsWith(TEXT(".obj.rsp.lc")))
+			{
+				continue;
+			}
+			TArray<FString> Lines;
+			if (!FFileHelper::LoadFileToStringArray(Lines, *ResponseFile) || Lines.Num() == 0)
+			{
+				continue;
+			}
+			const FString SourceFile = Lines[0].TrimStartAndEnd().TrimQuotes();
+			FString ObjectFile;
+			FString SharedResponse;
+			for (const FString& Line : Lines)
+			{
+				if (Line.StartsWith(TEXT("/Fo")))
+				{
+					ObjectFile = Line.RightChop(3).TrimQuotes();
+				}
+				else if (Line.StartsWith(TEXT("@")))
+				{
+					SharedResponse = Line.RightChop(1).TrimQuotes();
+				}
+			}
+			// Only files Live Coding would have had to rebuild.
+			const FDateTime SourceTime = Files.GetTimeStamp(*SourceFile);
+			if (SourceTime == FDateTime::MinValue() || Files.GetTimeStamp(*ObjectFile) >= SourceTime)
+			{
+				continue;
+			}
+
+			// The compiler sits next to the standard library the build includes.
+			FString Compiler;
+			TArray<FString> SharedLines;
+			FFileHelper::LoadFileToStringArray(SharedLines, *SharedResponse);
+			for (const FString& Line : SharedLines)
+			{
+				const int32 At = Line.Find(TEXT("\\VC\\Tools\\MSVC\\"));
+				if (Line.StartsWith(TEXT("/external:I")) && At != INDEX_NONE)
+				{
+					const FString IncludeDir = Line.RightChop(11).TrimStartAndEnd().TrimQuotes();
+					Compiler = FPaths::GetPath(IncludeDir) / TEXT("bin/Hostx64/x64/cl.exe");
+					break;
+				}
+			}
+			if (Compiler.IsEmpty() || !Files.FileExists(*Compiler))
+			{
+				continue;
+			}
+
+			FString CheckResponse;
+			for (const FString& Line : Lines)
+			{
+				if (Line.StartsWith(TEXT("/experimental:log")) || Line.StartsWith(TEXT("/sourceDependencies")))
+				{
+					continue;
+				}
+				CheckResponse += Line.StartsWith(TEXT("/Fo"))
+					? FString::Printf(TEXT("/Fo\"%s\""), *(ScratchDir / TEXT("compile_check.obj")))
+					: Line;
+				CheckResponse += TEXT("\n");
+			}
+			const FString CheckFile = ScratchDir / TEXT("compile_check.rsp");
+			if (!FFileHelper::SaveStringToFile(CheckResponse, *CheckFile))
+			{
+				continue;
+			}
+
+			++Checked;
+			int32 ReturnCode = 0;
+			FString StdOut, StdErr;
+			FPlatformProcess::ExecProcess(*Compiler, *FString::Printf(TEXT("@\"%s\""), *CheckFile), &ReturnCode, &StdOut, &StdErr, *WorkingDir);
+
+			TArray<FString> Output;
+			(StdOut + TEXT("\n") + StdErr).ParseIntoArrayLines(Output);
+			int32 Reported = 0;
+			for (const FString& Line : Output)
+			{
+				if (Reported < 40 && (Line.Contains(TEXT("error")) || Line.Contains(TEXT("warning C"))))
+				{
+					OutDiagnostics.Add(MakeShareable(new FJsonValueString(Line.Left(500))));
+					++Reported;
+				}
+			}
+			if (ReturnCode != 0 && Reported == 0)
+			{
+				OutDiagnostics.Add(MakeShareable(new FJsonValueString(
+					FString::Printf(TEXT("%s: the compiler exited with %d but printed no error lines"), *FPaths::GetCleanFilename(SourceFile), ReturnCode))));
+			}
+		}
+	}
+	Files.Delete(*(ScratchDir / TEXT("compile_check.obj")), false, true, true);
+}
+
+static FOpenCodeResponse OCHandleLiveCompile(const FOpenCodeRequest& Request)
+{
+#if PLATFORM_WINDOWS && WITH_EDITOR
+	ILiveCodingModule* LiveCoding = FModuleManager::GetModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME);
+	if (!LiveCoding)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, TEXT("The LiveCoding module is not loaded (enable Live Coding in Editor Preferences)"));
+	}
+
+	const FString ConsoleLogPath = FPaths::ConvertRelativePathToFull(FPaths::EngineDir() / TEXT("Programs/LiveCodingConsole/Saved/Logs/LiveCodingConsole.log"));
+	FString Before;
+	FFileHelper::LoadFileToString(Before, *ConsoleLogPath, FFileHelper::EHashOptions::None, FILEREAD_AllowWrite);
+
+	ELiveCodingCompileResult Result = ELiveCodingCompileResult::NotStarted;
+	LiveCoding->Compile(ELiveCodingCompileFlags::WaitForCompletion, &Result);
+
+	const TCHAR* ResultName = TEXT("Unknown");
+	switch (Result)
+	{
+	case ELiveCodingCompileResult::Success:            ResultName = TEXT("Success"); break;
+	case ELiveCodingCompileResult::NoChanges:          ResultName = TEXT("NoChanges"); break;
+	case ELiveCodingCompileResult::InProgress:         ResultName = TEXT("InProgress"); break;
+	case ELiveCodingCompileResult::CompileStillActive: ResultName = TEXT("CompileStillActive"); break;
+	case ELiveCodingCompileResult::NotStarted:         ResultName = TEXT("NotStarted"); break;
+	case ELiveCodingCompileResult::Failure:            ResultName = TEXT("Failure"); break;
+	case ELiveCodingCompileResult::Cancelled:          ResultName = TEXT("Cancelled"); break;
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("result"), ResultName);
+	Data->SetBoolField(TEXT("succeeded"), Result == ELiveCodingCompileResult::Success || Result == ELiveCodingCompileResult::NoChanges);
+	Data->SetStringField(TEXT("bridgeBuildBeforePatch"), FString(TEXT(__DATE__)) + TEXT(" ") + TEXT(__TIME__));
+
+	FString After;
+	TArray<TSharedPtr<FJsonValue>> Lines;
+	if (FFileHelper::LoadFileToString(After, *ConsoleLogPath, FFileHelper::EHashOptions::None, FILEREAD_AllowWrite))
+	{
+		const FString Added = (After.Len() >= Before.Len() && After.StartsWith(Before, ESearchCase::CaseSensitive)) ? After.Mid(Before.Len()) : After;
+		TArray<FString> Raw;
+		Added.ParseIntoArrayLines(Raw);
+		for (FString& Line : Raw)
+		{
+			// Benign linker noise that would otherwise bury the real messages.
+			if (Line.Contains(TEXT("Cannot find image section .voltbl")))
+			{
+				continue;
+			}
+			const int32 Tag = Line.Find(TEXT("LogLiveCodingServer: "));
+			if (Tag != INDEX_NONE)
+			{
+				Line = Line.Mid(Tag + 21);
+			}
+			if (Line.Len() > 400)
+			{
+				Line = Line.Left(400) + TEXT("...");
+			}
+			Lines.Add(MakeShareable(new FJsonValueString(Line)));
+		}
+		if (Lines.Num() > 200)
+		{
+			Lines.RemoveAt(0, Lines.Num() - 200);
+		}
+	}
+	Data->SetArrayField(TEXT("log"), Lines);
+
+	if (Result == ELiveCodingCompileResult::Failure)
+	{
+		TArray<TSharedPtr<FJsonValue>> Diagnostics;
+		OCDiagnoseFailedCompile(Diagnostics);
+		Data->SetArrayField(TEXT("diagnostics"), Diagnostics);
+	}
+	return FOpenCodeResponse::Success(Request.Id, Data);
+#else
+	return FOpenCodeResponse::Failure(Request.Id, TEXT("Live Coding is only available in the Windows editor"));
 #endif
 }

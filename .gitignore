@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.js
 !*.json
+
+# UEPlugin is a junction to the live plugin inside the UE project: its build
+# products are not part of this repo.
+UEPlugin/Binaries/
+UEPlugin/Intermediate/

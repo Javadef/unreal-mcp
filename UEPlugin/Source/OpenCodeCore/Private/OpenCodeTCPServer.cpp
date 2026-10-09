@@ -205,16 +205,26 @@ uint32 FOpenCodeTCPConnection::Run()
 
 	while (!bStopRequested && Socket)
 	{
+		// Wait until the socket is readable: that means data, or a close.
+		//
+		// A bare Recv cannot tell the two apart on this (non-blocking) socket.
+		// FSocketBSD::Recv reports "nothing has arrived yet" as success with
+		// zero bytes, and this loop used to read that as the peer hanging up —
+		// so any connection whose request had not landed by the first Recv was
+		// dropped (the client saw an aborted connection), and no connection
+		// ever outlived one request. The timeout is the bStopRequested cadence.
+		if (!Socket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(100)))
+		{
+			continue;
+		}
+
 		int32 BytesRead = 0;
 		if (Socket->Recv(TempBuf, sizeof(TempBuf), BytesRead))
 		{
 			if (BytesRead == 0)
 			{
-				// Recv success with zero bytes = peer closed the connection
-				// gracefully. Previously this fell through to the sleep branch
-				// and the thread spun forever on a dead socket.
-				UE_LOG(LogTemp, Log, TEXT("OpenCodeTCPServer: Client disconnected"));
-				break;
+				// Readable but would block after all: nothing to do yet.
+				continue;
 			}
 
 			FUTF8ToTCHAR Converter(reinterpret_cast<const ANSICHAR*>(TempBuf), BytesRead);
@@ -244,12 +254,10 @@ uint32 FOpenCodeTCPConnection::Run()
 		}
 		else
 		{
-			if (Socket->GetConnectionState() == SCS_ConnectionError)
-			{
-				UE_LOG(LogTemp, Log, TEXT("OpenCodeTCPServer: Client connection error, closing"));
-				break;
-			}
-			FPlatformProcess::Sleep(0.001f);
+			// Readable, and Recv failed: for a stream socket that is the peer
+			// closing (recv returned 0) or the connection breaking.
+			UE_LOG(LogTemp, Log, TEXT("OpenCodeTCPServer: Client disconnected"));
+			break;
 		}
 	}
 
