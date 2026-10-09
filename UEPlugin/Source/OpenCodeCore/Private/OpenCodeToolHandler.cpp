@@ -24,6 +24,10 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstance.h"
+#include "Engine/Texture.h"
+#include "Misc/PackageName.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionComment.h"
@@ -82,6 +86,7 @@ void FOpenCodeToolHandler::RegisterTools()
 	RegisterTool(TEXT("search_classes"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleSearchClasses));
 	RegisterTool(TEXT("get_cpp_hierarchy"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetCppHierarchy));
 	RegisterTool(TEXT("get_material_graph"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetMaterialGraph));
+	RegisterTool(TEXT("get_material_parameters"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleGetMaterialParameters));
 	RegisterTool(TEXT("run_python"), FOpenCodeToolDelegate::CreateStatic(&FOpenCodeToolHandler::HandleRunPython));
 }
 
@@ -371,13 +376,31 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	Filter.bRecursivePaths = true;
 	Filter.bRecursiveClasses = true;
 
+	bool bIncludeInstances = false;
+	Request.Args->TryGetBoolField(TEXT("includeInstances"), bIncludeInstances);
+
+	TArray<FString> SearchedRoots;
 	if (!PathPrefix.IsEmpty())
 	{
 		Filter.PackagePaths.Add(*PathPrefix);
 	}
 	else
 	{
-		Filter.PackagePaths.Add(TEXT("/Game"));
+		// No prefix: search every mounted content root (project + plugins) except
+		// /Engine, so projects whose content lives under a plugin mount (not /Game)
+		// are found without the caller knowing the mount name.
+		TArray<FString> RootPaths;
+		FPackageName::QueryRootContentPaths(RootPaths);
+		for (FString Root : RootPaths)
+		{
+			Root.RemoveFromEnd(TEXT("/"));
+			if (Root.StartsWith(TEXT("/Engine")))
+			{
+				continue;
+			}
+			Filter.PackagePaths.Add(*Root);
+			SearchedRoots.Add(Root);
+		}
 	}
 
 	// assetType handling. When the string resolves to a real UClass we use the
@@ -389,15 +412,17 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	bool bAssetTypeResolved = false;
 	if (!AssetTypeFilter.IsEmpty())
 	{
-		UClass* Class = FindObject<UClass>(nullptr, *(TEXT("/Script/Engine.") + AssetTypeFilter));
-		if (!Class)
-		{
-			Class = FindObject<UClass>(nullptr, *(TEXT("/Script/CoreUObject.") + AssetTypeFilter));
-		}
+		// Resolve by bare name across all loaded modules, native classes first.
+		UClass* Class = FindFirstObject<UClass>(*AssetTypeFilter, EFindFirstObjectOptions::NativeFirst);
 		if (Class)
 		{
 			Filter.ClassPaths.Add(FTopLevelAssetPath(Class));
 			bAssetTypeResolved = true;
+			// "Material" is UMaterial only; instances are a sibling class tree.
+			if (bIncludeInstances && Class == UMaterial::StaticClass())
+			{
+				Filter.ClassPaths.Add(FTopLevelAssetPath(UMaterialInstance::StaticClass()));
+			}
 		}
 	}
 
@@ -450,7 +475,7 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleSearchAssets(const FOpenCodeReques
 	Data->SetNumberField(TEXT("total"), TotalMatches);
 	if (PathPrefix.IsEmpty())
 	{
-		Data->SetStringField(TEXT("note"), TEXT("No pathPrefix given — searched /Game only. Plugin content (e.g. marketplace assets) lives under its own mount point, e.g. /PluginName — pass pathPrefix explicitly to search there."));
+		Data->SetStringField(TEXT("note"), FString::Printf(TEXT("No pathPrefix given — searched all content roots except /Engine: %s"), *FString::Join(SearchedRoots, TEXT(", "))));
 	}
 	else if (!AssetTypeFilter.IsEmpty() && !bAssetTypeResolved)
 	{
@@ -1529,6 +1554,108 @@ FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialGraph(const FOpenCodeRe
 			Node->SetArrayField(TEXT("connections"), Connections);
 		}
 	}
+
+	return FOpenCodeResponse::Success(Request.Id, Data);
+}
+
+// Effective value of every scalar/vector/texture/static-switch parameter of a
+// Material or MaterialInstance (resolved through the parent chain), with
+// `overridden` marking values set on the asset itself rather than inherited.
+FOpenCodeResponse FOpenCodeToolHandler::HandleGetMaterialParameters(const FOpenCodeRequest& Request)
+{
+	FString AssetPath;
+	Request.Args->TryGetStringField(TEXT("assetPath"), AssetPath);
+
+	UMaterialInterface* Mat = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *AssetPath));
+	if (!Mat)
+	{
+		return FOpenCodeResponse::Failure(Request.Id, FString::Printf(TEXT("Material or MaterialInstance not found: %s"), *AssetPath));
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShareable(new FJsonObject());
+	Data->SetStringField(TEXT("asset"), Mat->GetPathName());
+	Data->SetStringField(TEXT("class"), Mat->GetClass()->GetName());
+
+	// Parent chain, nearest first, ending at the base UMaterial.
+	TArray<TSharedPtr<FJsonValue>> Chain;
+	for (const UMaterialInterface* Cur = Mat; Cur; )
+	{
+		Chain.Add(MakeShareable(new FJsonValueString(Cur->GetPathName())));
+		const UMaterialInstance* Inst = Cast<UMaterialInstance>(Cur);
+		Cur = Inst ? Inst->Parent.Get() : nullptr;
+	}
+	Data->SetArrayField(TEXT("parentChain"), Chain);
+
+	TArray<FMaterialParameterInfo> Infos;
+	TArray<FGuid> Ids;
+
+	auto ParamBase = [](const FMaterialParameterInfo& Info, bool bOverridden)
+	{
+		TSharedPtr<FJsonObject> P = MakeShareable(new FJsonObject());
+		P->SetStringField(TEXT("name"), Info.Name.ToString());
+		P->SetBoolField(TEXT("overridden"), bOverridden);
+		return P;
+	};
+
+	TArray<TSharedPtr<FJsonValue>> Scalars;
+	Mat->GetAllScalarParameterInfo(Infos, Ids);
+	for (const FMaterialParameterInfo& Info : Infos)
+	{
+		float Value = 0.f, Dummy = 0.f;
+		Mat->GetScalarParameterValue(Info, Value);
+		const bool bOver = Mat->GetScalarParameterValue(Info, Dummy, true);
+		TSharedPtr<FJsonObject> P = ParamBase(Info, bOver);
+		P->SetNumberField(TEXT("value"), Value);
+		Scalars.Add(MakeShareable(new FJsonValueObject(P)));
+	}
+	Data->SetArrayField(TEXT("scalars"), Scalars);
+
+	TArray<TSharedPtr<FJsonValue>> Vectors;
+	Infos.Reset(); Ids.Reset();
+	Mat->GetAllVectorParameterInfo(Infos, Ids);
+	for (const FMaterialParameterInfo& Info : Infos)
+	{
+		FLinearColor Value = FLinearColor::Black, Dummy;
+		Mat->GetVectorParameterValue(Info, Value);
+		const bool bOver = Mat->GetVectorParameterValue(Info, Dummy, true);
+		TSharedPtr<FJsonObject> P = ParamBase(Info, bOver);
+		P->SetNumberField(TEXT("r"), Value.R);
+		P->SetNumberField(TEXT("g"), Value.G);
+		P->SetNumberField(TEXT("b"), Value.B);
+		P->SetNumberField(TEXT("a"), Value.A);
+		Vectors.Add(MakeShareable(new FJsonValueObject(P)));
+	}
+	Data->SetArrayField(TEXT("vectors"), Vectors);
+
+	TArray<TSharedPtr<FJsonValue>> Textures;
+	Infos.Reset(); Ids.Reset();
+	Mat->GetAllTextureParameterInfo(Infos, Ids);
+	for (const FMaterialParameterInfo& Info : Infos)
+	{
+		UTexture* Value = nullptr;
+		UTexture* Dummy = nullptr;
+		Mat->GetTextureParameterValue(Info, Value);
+		const bool bOver = Mat->GetTextureParameterValue(Info, Dummy, true);
+		TSharedPtr<FJsonObject> P = ParamBase(Info, bOver);
+		P->SetStringField(TEXT("texture"), Value ? Value->GetPathName() : FString());
+		Textures.Add(MakeShareable(new FJsonValueObject(P)));
+	}
+	Data->SetArrayField(TEXT("textures"), Textures);
+
+	TArray<TSharedPtr<FJsonValue>> Switches;
+	Infos.Reset(); Ids.Reset();
+	Mat->GetAllStaticSwitchParameterInfo(Infos, Ids);
+	for (const FMaterialParameterInfo& Info : Infos)
+	{
+		bool Value = false, Dummy = false;
+		FGuid Guid;
+		Mat->GetStaticSwitchParameterValue(Info, Value, Guid);
+		const bool bOver = Mat->GetStaticSwitchParameterValue(Info, Dummy, Guid, true);
+		TSharedPtr<FJsonObject> P = ParamBase(Info, bOver);
+		P->SetBoolField(TEXT("value"), Value);
+		Switches.Add(MakeShareable(new FJsonValueObject(P)));
+	}
+	Data->SetArrayField(TEXT("staticSwitches"), Switches);
 
 	return FOpenCodeResponse::Success(Request.Id, Data);
 }

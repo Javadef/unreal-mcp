@@ -158,8 +158,9 @@ server.tool("search_assets",
   "Search UE project assets by name, type, or path.",
   {
     query: z.string().optional().describe("Search query to match against asset names"),
-    assetType: z.string().optional().describe("Filter by asset type (e.g. StaticMesh, Material, Texture2D)"),
-    pathPrefix: z.string().optional().describe("Filter by content path prefix (e.g. /Game/Environment)"),
+    assetType: z.string().optional().describe("Filter by UClass name (e.g. StaticMesh, Texture2D, MaterialInterface = materials + instances). Resolved across all modules; unresolved names fall back to class-name substring."),
+    includeInstances: z.boolean().optional().describe("With assetType 'Material', also return MaterialInstances (default false)"),
+    pathPrefix: z.string().optional().describe("Filter by content path prefix (e.g. /Game/Environment). If omitted, all mounted content roots except /Engine are searched."),
     limit: z.number().optional().describe("Max results (default 50)"),
     offset: z.number().optional().describe("Pagination offset (default 0)"),
   },
@@ -324,6 +325,15 @@ server.tool("get_material_graph",
   { assetPath: z.string().describe("Full asset path to Material or MaterialFunction") },
   async ({ assetPath }) => {
     const result = await sendToUE({ tool: "get_material_graph", args: { assetPath } });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.tool("get_material_parameters",
+  "Get the effective scalar, vector, texture and static-switch parameter values of a Material or MaterialInstance (resolved through the parent chain), with an `overridden` flag for values set on the asset itself.",
+  { assetPath: z.string().describe("Full asset path to a Material or MaterialInstance") },
+  async ({ assetPath }) => {
+    const result = await sendToUE({ tool: "get_material_parameters", args: { assetPath } });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
